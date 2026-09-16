@@ -1,0 +1,6 @@
+USE corrida_mpl;
+SET @existe := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='lotes' AND COLUMN_NAME='categoria_id');
+SET @sql := IF(@existe=0,'ALTER TABLE lotes ADD COLUMN categoria_id INT UNSIGNED NULL AFTER corrida_id','SELECT 1');
+PREPARE comando FROM @sql;
+EXECUTE comando;
+DEALLOCATE PREPARE comando;

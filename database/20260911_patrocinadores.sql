@@ -1,0 +1,27 @@
+-- Solicitações e publicação de patrocinadores da 4ª Corrida MPL.
+CREATE TABLE IF NOT EXISTS patrocinadores (
+    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    corrida_id INT UNSIGNED NOT NULL,
+    empresa_nome VARCHAR(180) NOT NULL,
+    cnpj VARCHAR(18) NULL,
+    responsavel_nome VARCHAR(160) NOT NULL,
+    responsavel_cargo VARCHAR(120) NULL,
+    email VARCHAR(190) NOT NULL,
+    telefone VARCHAR(40) NOT NULL,
+    site_url VARCHAR(255) NULL,
+    modalidade_interesse ENUM('CONTRIBUICAO','PRODUTOS') NOT NULL DEFAULT 'CONTRIBUICAO',
+    mensagem TEXT NULL,
+    status ENUM('PENDENTE','EM_ANALISE','APROVADO','RECUSADO') NOT NULL DEFAULT 'PENDENTE',
+    observacoes_admin TEXT NULL,
+    analisado_em DATETIME NULL,
+    analisado_por INT UNSIGNED NULL,
+    logo_path VARCHAR(255) NULL,
+    publicado TINYINT(1) NOT NULL DEFAULT 0,
+    criado_em DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_patrocinadores_corrida_status (corrida_id, status),
+    KEY idx_patrocinadores_publicacao (corrida_id, status, publicado),
+    CONSTRAINT fk_patrocinadores_corrida FOREIGN KEY (corrida_id) REFERENCES corridas(id),
+    CONSTRAINT fk_patrocinadores_analisado_por FOREIGN KEY (analisado_por) REFERENCES usuarios_admin(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
