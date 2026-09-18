@@ -21,7 +21,9 @@ function mplMailSmtp($config, $to, $subject, $body, $contentType) {
     $port = (int)(isset($config['mail_smtp_port']) ? $config['mail_smtp_port'] : 587);
     $encryption = strtolower(trim((string)(isset($config['mail_smtp_encryption']) ? $config['mail_smtp_encryption'] : 'tls')));
     $timeout = max(3, min(30, (int)(isset($config['mail_smtp_timeout']) ? $config['mail_smtp_timeout'] : 10)));
-    if ($host === '' || $port < 1 || $port > 65535) throw new RuntimeException('Servidor SMTP não configurado.');
+    if ($host === '' || strpos($host, '@') !== false || !preg_match('/^[a-z0-9.-]+$/i', $host) || $port < 1 || $port > 65535) {
+        throw new RuntimeException('Servidor SMTP não configurado corretamente.');
+    }
     $target = ($encryption === 'ssl' ? 'ssl://' : 'tcp://') . $host . ':' . $port;
     $errno = 0; $error = '';
     $context = stream_context_create(array('ssl' => array('verify_peer' => true, 'verify_peer_name' => true, 'allow_self_signed' => false, 'CN_match' => $host, 'SNI_enabled' => true, 'SNI_server_name' => $host)));
@@ -76,6 +78,7 @@ function mplMailSmtp($config, $to, $subject, $body, $contentType) {
 }
 
 function mplMailSend($config, $to, $subject, $body, $contentType) {
+    $GLOBALS['mpl_mail_last_error'] = '';
     if (filter_var((string)(isset($config['mail_enabled']) ? $config['mail_enabled'] : '0'), FILTER_VALIDATE_BOOLEAN) !== true) return false;
     $from = trim((string)(isset($config['mail_from']) ? $config['mail_from'] : ''));
     if (!filter_var($to, FILTER_VALIDATE_EMAIL) || !filter_var($from, FILTER_VALIDATE_EMAIL)) return false;
@@ -86,7 +89,12 @@ function mplMailSend($config, $to, $subject, $body, $contentType) {
         $headers = array('From: 4ª Corrida MPL <' . $from . '>', 'Reply-To: ' . $from, 'MIME-Version: 1.0', 'Content-Type: ' . $contentType);
         return @mail($to, '=?UTF-8?B?' . base64_encode($subject) . '?=', $body, implode("\r\n", $headers));
     } catch (Exception $e) {
+        $GLOBALS['mpl_mail_last_error'] = $e->getMessage();
         error_log('[MPL Mail] ' . $e->getMessage());
         return false;
     }
+}
+
+function mplMailLastError() {
+    return isset($GLOBALS['mpl_mail_last_error']) ? (string)$GLOBALS['mpl_mail_last_error'] : '';
 }

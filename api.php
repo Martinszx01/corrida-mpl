@@ -353,6 +353,20 @@ function enviarEmailCorredor($c, $to, $subject, $message) {
     return $sent;
 }
 
+function mensagemFalhaEmailMpl($acao) {
+    $erro = function_exists('mplMailLastError') ? mplMailLastError() : '';
+    if (strpos($erro, 'código 535') !== false || strpos($erro, 'codigo 535') !== false) {
+        return 'O servidor de e-mail recusou o usuário ou a senha SMTP. Solicite à TI a credencial da conta remetente.';
+    }
+    if (strpos($erro, 'conectar ao servidor SMTP') !== false) {
+        return 'Não foi possível conectar ao servidor de e-mail. Verifique host, porta e liberação de rede.';
+    }
+    if (strpos($erro, 'ativar TLS') !== false) {
+        return 'O servidor de e-mail recusou a conexão segura. Verifique a porta e o tipo de criptografia SMTP.';
+    }
+    return 'Não foi possível ' . $acao . '. Verifique a configuração SMTP do servidor.';
+}
+
 function emailInscricao($registration) {
     return "Olá, {$registration['nome_completo']}!\n\n"
         . "Sua inscrição na 4ª Corrida MPL foi registrada.\n\n"
@@ -990,7 +1004,7 @@ try {
         }
 
         if ($what === 'invitation-options') {
-            $rows = $db->query("SELECT co.id AS event_id, co.nome AS event_name, ca.id AS category_id, ca.nome AS category_name, d.distancia_km FROM corridas co JOIN categorias ca ON ca.corrida_id=co.id AND ca.ativa=1 JOIN distancias d ON d.id=ca.distancia_id WHERE co.status='publicada' ORDER BY co.data_corrida DESC, ca.ordem, ca.id")->fetchAll();
+            $rows = $db->query("SELECT co.id AS event_id, co.nome AS event_name, ca.id AS category_id, ca.nome AS category_name, d.distancia_km FROM corridas co JOIN categorias ca ON ca.corrida_id=co.id AND ca.ativa=1 JOIN distancias d ON d.id=ca.distancia_id WHERE co.status='publicada' AND d.distancia_km=5 ORDER BY co.data_corrida DESC, ca.ordem, ca.id")->fetchAll();
             resposta($rows);
         }
 
@@ -1006,9 +1020,9 @@ try {
         }
 
         if ($what === 'create-invitation') {
-            $eventId = (int) (isset($dados['event_id']) ? $dados['event_id'] : 0); $categoryId = (int) (isset($dados['category_id']) ? $dados['category_id'] : 0);
-            $q = $db->prepare("SELECT ca.id FROM categorias ca JOIN corridas co ON co.id=ca.corrida_id JOIN distancias d ON d.id=ca.distancia_id WHERE ca.id=? AND ca.corrida_id=? AND ca.ativa=1 AND co.status='publicada' LIMIT 1");
-            $q->execute(array($categoryId, $eventId)); if (!$q->fetch()) resposta(array('error' => 'Corrida ou categoria inválida.'), 422);
+            $eventId = (int) (isset($dados['event_id']) ? $dados['event_id'] : 0);
+            $q = $db->prepare("SELECT ca.id FROM categorias ca JOIN corridas co ON co.id=ca.corrida_id JOIN distancias d ON d.id=ca.distancia_id WHERE ca.corrida_id=? AND ca.ativa=1 AND co.status='publicada' AND d.distancia_km=5 ORDER BY ca.ordem,ca.id LIMIT 1");
+            $q->execute(array($eventId)); $categoryId = (int) $q->fetchColumn(); if (!$categoryId) resposta(array('error' => 'A prova de 5 km não está disponível para esta corrida.'), 422);
             $token = bin2hex(random_bytes(32)); $hours = max(1, min(8760, (int) $config['invitation_expires_hours']));
             $q = $db->prepare('INSERT INTO convites_colaboradores (corrida_id,categoria_id,token_hash,token_criptografado,expira_em,criado_por) VALUES (?,?,?,?,DATE_ADD(NOW(), INTERVAL ? HOUR),?)');
             $q->execute(array($eventId, $categoryId, hash('sha256', $token), conviteCriptografar($token, $config['jwt_secret']), $hours, (int) $u['sub']));
@@ -1796,21 +1810,17 @@ try {
         $registrationId = (int) ((isset($dados['registration_id']) ? $dados['registration_id'] : 0));
         $registration = paymentOwner($db, $registrationId);
         $confirmed = in_array($registration['status'], ['paga', 'confirmada'], true);
-        $ticketToken = null;
         if ($confirmed) {
-            $q = $db->prepare("SELECT token FROM tickets WHERE inscricao_id = ? AND status = 'ativo' LIMIT 1");
-            $q->execute([$registrationId]);
-            $ticket = $q->fetch();
-            if ($ticket) {
-                $ticketToken = (string) $ticket['token'];
-            } else {
-                $ticketToken = 'MPL-RACE-TICKET-' . strtoupper(bin2hex(random_bytes(8)));
-                $q = $db->prepare('INSERT INTO tickets (inscricao_id, token, qr_code_data) VALUES (?, ?, ?)');
-                $q->execute([$registrationId, $ticketToken, $ticketToken]);
-                $ticketId = (int) $db->lastInsertId();
-                $db->prepare('INSERT IGNORE INTO retiradas_kit (inscricao_id, ticket_id) VALUES (?, ?)')->execute([$registrationId, $ticketId]);
+            $sent = enviarIngressoMpl($db, $config, $registrationId, $registration['tipo'] === 'colaborador_mpl');
+            if (!$sent) {
+                auditLog($db, null, 'EMAIL_INGRESSO_SOLICITADO_FALHOU', 'inscricoes', $registrationId, 'Falha no envio solicitado pela área Minha inscrição.');
+                resposta(array('error' => mensagemFalhaEmailMpl('enviar o ingresso')), 503);
             }
+            $db->prepare('UPDATE pagamentos_gateway SET email_confirmacao_em = COALESCE(email_confirmacao_em, NOW()), email_tentativa_em = NULL, ultimo_erro_email = NULL WHERE inscricao_id = ?')->execute(array($registrationId));
+            auditLog($db, null, 'EMAIL_INGRESSO_SOLICITADO', 'inscricoes', $registrationId, 'Ingresso e QR Code enviados pela área Minha inscrição.');
+            resposta(array('ok' => true, 'email_sent' => true, 'has_qr' => true));
         }
+
         $site = rtrim((string) ((isset($config['site_url']) ? $config['site_url'] : '')), '/');
         $message = "Olá, {$registration['nome_completo']}!\n\n"
             . "Acesse sua área da 4ª Corrida MPL pelo link:\n"
@@ -1818,12 +1828,12 @@ try {
             . "Número da inscrição: {$registration['numero']}\n"
             . "Categoria: {$registration['categoria_nome']}\n"
             . "Distância: {$registration['distancia_km']} km\n"
-            . "Status: " . ($confirmed ? 'Inscrição confirmada' : 'Pagamento pendente') . "\n\n";
-        if ($ticketToken)
-            $message .= "QR Code / token do ingresso:\n{$ticketToken}\n\n";
+            . "Status: Pagamento pendente\n\n";
         $message .= "Se você não solicitou este acesso, ignore esta mensagem.\n\n4ª Corrida MPL";
-        $sent = enviarEmailCorredor($config, $registration['email'], $confirmed ? 'Seu acesso e QR Code, 4ª Corrida MPL' : 'Seu acesso à inscrição, 4ª Corrida MPL', $message);
-        resposta(['ok' => true, 'email_sent' => $sent, 'has_qr' => (bool) $ticketToken]);
+        $sent = enviarEmailCorredor($config, $registration['email'], 'Seu acesso à inscrição, 4ª Corrida MPL', $message);
+        if (!$sent) resposta(array('error' => mensagemFalhaEmailMpl('enviar o acesso')), 503);
+        auditLog($db, null, 'EMAIL_ACESSO_SOLICITADO', 'inscricoes', $registrationId, 'Acesso enviado pela área Minha inscrição; pagamento ainda pendente.');
+        resposta(array('ok' => true, 'email_sent' => true, 'has_qr' => false));
     }
 
     if ($acao === 'resend-registration-email') {
@@ -1842,7 +1852,9 @@ try {
                 'valor' => $registration['valor']
             ])
         );
-        resposta(['ok' => true, 'email_sent' => $sent]);
+        if (!$sent) resposta(array('error' => mensagemFalhaEmailMpl('reenviar os dados')), 503);
+        auditLog($db, null, 'EMAIL_INSCRICAO_REENVIADO', 'inscricoes', $registrationId, 'Dados da inscrição reenviados pela área Minha inscrição.');
+        resposta(array('ok' => true, 'email_sent' => true));
     }
 
     if ($acao === 'create-registration') {
@@ -1850,19 +1862,28 @@ try {
         $isCollaborator = $invitationToken !== '';
         if ($isCollaborator && !preg_match('/^[a-f0-9]{64}$/', $invitationToken)) resposta(array('error' => 'Convite inválido.'), 404);
 
-        $requiredRegistration = array('name','cpf','birth_date','gender','email','phone','category_id','shirt_size','zip_code','street','address_number','neighborhood','city','state','emergency_name','emergency_phone','terms');
+        $requiredRegistration = array('name','cpf','birth_date','gender','email','phone','shirt_size');
         foreach ($requiredRegistration as $field) {
             if (trim((string) (isset($dados[$field]) ? $dados[$field] : '')) === '') resposta(array('error' => 'Preencha todos os campos obrigatórios da inscrição.'), 422);
         }
+        $acceptedValues = array('1', 'true', 'on', 'yes');
+        $rulesAccepted = in_array(strtolower(trim((string) (isset($dados['rules_accepted']) ? $dados['rules_accepted'] : ''))), $acceptedValues, true);
+        $lgpdAccepted = in_array(strtolower(trim((string) (isset($dados['lgpd_accepted']) ? $dados['lgpd_accepted'] : ''))), $acceptedValues, true);
+        if (!$rulesAccepted || !$lgpdAccepted) resposta(array('error' => 'Aceite o regulamento e os termos da LGPD para continuar.'), 422);
+        $hasEmergencyContact = in_array(strtolower(trim((string) (isset($dados['has_emergency_contact']) ? $dados['has_emergency_contact'] : ''))), $acceptedValues, true);
+        $emergencyName = trim((string) (isset($dados['emergency_name']) ? $dados['emergency_name'] : ''));
+        $emergencyPhone = trim((string) (isset($dados['emergency_phone']) ? $dados['emergency_phone'] : ''));
+        $emergencyRelationship = trim((string) (isset($dados['emergency_relationship']) ? $dados['emergency_relationship'] : ''));
+        if ($hasEmergencyContact && ($emergencyName === '' || strlen(preg_replace('/\D/', '', $emergencyPhone)) < 10)) resposta(array('error' => 'Confira o nome e o celular do contato de emergência.'), 422);
         $cpf = preg_replace('/\D/', '', (string) $dados['cpf']);
         $email = strtolower(trim((string) $dados['email']));
         $birth = DateTime::createFromFormat('Y-m-d', (string)$dados['birth_date']);
         $birthValid = $birth && $birth->format('Y-m-d') === (string)$dados['birth_date'] && $birth->getTimestamp() < time();
         $shirt = strtoupper(trim((string)$dados['shirt_size']));
-        $state = strtoupper(trim((string)$dados['state']));
         if (!cpfValido($cpf) || !filter_var($email, FILTER_VALIDATE_EMAIL)) resposta(array('error' => 'Confira o CPF e o e-mail informados.'), 422);
-        if (!$birthValid || !in_array($shirt, array('PP','P','M','G','GG','XG','XGG'), true) || !preg_match('/^[A-Z]{2}$/', $state)) resposta(array('error' => 'Confira nascimento, camiseta e estado.'), 422);
-        if (mb_strlen(trim((string)$dados['name'])) < 3 || strlen(preg_replace('/\D/','',(string)$dados['phone'])) < 10 || strlen(preg_replace('/\D/','',(string)$dados['emergency_phone'])) < 10) resposta(array('error' => 'Confira nome e telefones informados.'), 422);
+        if (!$birthValid || !in_array($shirt, array('PP','P','M','G','GG','XG','XGG'), true)) resposta(array('error' => 'Confira a data de nascimento e o tamanho da camiseta.'), 422);
+        if (!in_array(strtoupper(trim((string)$dados['gender'])), array('F','M','OUTRO'), true)) resposta(array('error' => 'Selecione uma opção de gênero válida.'), 422);
+        if (mb_strlen(trim((string)$dados['name'])) < 3 || strlen(preg_replace('/\D/','',(string)$dados['phone'])) < 10) resposta(array('error' => 'Confira o nome e o celular com DDD.'), 422);
 
         $db->beginTransaction();
         try {
@@ -1875,9 +1896,6 @@ try {
                 }
                 if ($invite['event_status'] !== 'publicada' || !(int) $invite['category_active']) {
                     $db->rollBack(); resposta(array('error' => 'A corrida ou categoria deste convite não está disponível.'), 409);
-                }
-                if ((int) $dados['category_id'] !== (int) $invite['categoria_id']) {
-                    $db->rollBack(); resposta(array('error' => 'A categoria não corresponde ao convite.'), 422);
                 }
                 $eventId = (int) $invite['corrida_id'];
             } else {
@@ -1902,8 +1920,8 @@ try {
             if ($isCollaborator) {
                 $cat = array('id'=>(int)$invite['categoria_id'],'nome'=>$invite['category_name'],'distancia_id'=>(int)$invite['distancia_id'],'distancia_km'=>$invite['distancia_km'],'preco'=>0,'idade_minima'=>$invite['idade_minima'],'idade_maxima'=>$invite['idade_maxima']);
             } else {
-                $q=$db->prepare("SELECT c.*,d.distancia_km FROM categorias c JOIN distancias d ON d.id=c.distancia_id WHERE c.id=? AND c.corrida_id=? AND c.ativa=1 LIMIT 1");
-                $q->execute(array((int)$dados['category_id'],$eventId)); $cat=$q->fetch(); if(!$cat) throw new RuntimeException('Categoria inválida.');
+                $q=$db->prepare("SELECT c.*,d.distancia_km FROM categorias c JOIN distancias d ON d.id=c.distancia_id WHERE c.corrida_id=? AND c.ativa=1 AND d.distancia_km=5 ORDER BY c.ordem,c.id LIMIT 1");
+                $q->execute(array($eventId)); $cat=$q->fetch(); if(!$cat) throw new RuntimeException('A prova de 5 km não está disponível.');
                 $q=$db->prepare("SELECT * FROM lotes WHERE corrida_id=? AND categoria_id=? AND ativo=1 AND (inicio IS NULL OR inicio<=NOW()) AND (fim IS NULL OR fim>=NOW()) AND (quantidade=0 OR vendidos<quantidade) ORDER BY inicio,id LIMIT 1 FOR UPDATE");
                 $q->execute(array($eventId,(int)$cat['id'])); $lot=$q->fetch(); if(!$lot) throw new RuntimeException('Não há lote disponível para esta categoria.');
                 $lotId=(int)$lot['id']; $cat['preco']=$lot['preco'];
@@ -1917,10 +1935,10 @@ try {
             $q=$db->prepare('INSERT INTO inscricoes (numero,corrida_id,participante_id,categoria_id,distancia_id,lote_id,status,tipo,valor) VALUES (?,?,?,?,?,?,?,?,?)');
             $q->execute(array($numero,$eventId,$pid,$cat['id'],$cat['distancia_id'],$lotId,$status,$type,$value)); $id=(int)$db->lastInsertId();
 
-            $db->prepare('DELETE FROM enderecos WHERE participante_id=?')->execute(array($pid));
-            $db->prepare('INSERT INTO enderecos (participante_id,cep,rua,numero,complemento,bairro,cidade,estado) VALUES (?,?,?,?,?,?,?,?)')->execute(array($pid,preg_replace('/\D/','',(string)$dados['zip_code']),trim((string)$dados['street']),trim((string)$dados['address_number']),trim((string)(isset($dados['complement'])?$dados['complement']:'')) ?: null,trim((string)$dados['neighborhood']),trim((string)$dados['city']),$state));
             $db->prepare('DELETE FROM contatos_emergencia WHERE participante_id=?')->execute(array($pid));
-            $db->prepare('INSERT INTO contatos_emergencia (participante_id,nome,telefone,parentesco) VALUES (?,?,?,?)')->execute(array($pid,trim((string)$dados['emergency_name']),trim((string)$dados['emergency_phone']),trim((string)(isset($dados['emergency_relationship'])?$dados['emergency_relationship']:'')) ?: null));
+            if ($hasEmergencyContact) {
+                $db->prepare('INSERT INTO contatos_emergencia (participante_id,nome,telefone,parentesco) VALUES (?,?,?,?)')->execute(array($pid,$emergencyName,$emergencyPhone,$emergencyRelationship !== '' ? $emergencyRelationship : null));
+            }
             if (!$isCollaborator) {
                 $q=$db->prepare('UPDATE lotes SET vendidos=vendidos+1 WHERE id=? AND (quantidade=0 OR vendidos<quantidade)'); $q->execute(array($lotId));
                 if ($q->rowCount() !== 1) throw new RuntimeException('As vagas deste lote acabaram. Selecione outro lote.');
@@ -1941,7 +1959,7 @@ try {
                 $registrationEmail=array('nome_completo'=>$dados['name'],'email'=>$email,'numero'=>$numero,'categoria_nome'=>$cat['nome'],'distancia_km'=>$cat['distancia_km'],'valor'=>$value);
                 $emailSent=enviarEmailCorredor($config,$email,'Inscrição recebida, 4ª Corrida MPL',emailInscricao($registrationEmail));
             }
-            auditLog($db, null, 'INSCRICAO_CRIADA', 'inscricoes', $id, $isCollaborator ? 'Inscrição de colaborador criada por convite.' : 'Inscrição pública criada.');
+            auditLog($db, null, 'INSCRICAO_CRIADA', 'inscricoes', $id, ($isCollaborator ? 'Inscrição de colaborador criada por convite. ' : 'Inscrição pública criada. ') . 'Regulamento e LGPD aceitos; contato de emergência ' . ($hasEmergencyContact ? 'informado.' : 'não informado.'));
             resposta(array('id'=>$id,'number'=>$numero,'email_sent'=>$emailSent,'type'=>strtoupper($type),'payment_status'=>$isCollaborator?'ISENTO':'PENDING','is_collaborator'=>$isCollaborator,'participant_token'=>$participantToken,'participant_email'=>$email));
         } catch (Exception $z) {
             if ($db->inTransaction()) $db->rollBack();

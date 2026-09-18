@@ -43,9 +43,9 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-" 
   <meta property="og:title" content="<?= htmlspecialchars($pageTitle, ENT_QUOTES, 'UTF-8') ?>">
   <meta property="og:description" content="<?= htmlspecialchars($pageDescription, ENT_QUOTES, 'UTF-8') ?>">
   <meta property="og:url" content="<?= htmlspecialchars($canonicalUrl, ENT_QUOTES, 'UTF-8') ?>">
-  <meta property="og:image" content="<?= htmlspecialchars(rtrim($config['site_url'], '/') . '/assets/images/banners/banner-principal.jpg', ENT_QUOTES, 'UTF-8') ?>">
+  <meta property="og:image" content="<?= htmlspecialchars(rtrim($config['site_url'], '/') . '/assets/images/banners/banner-principal.jpg?v=20260918', ENT_QUOTES, 'UTF-8') ?>">
   <link rel="icon" href="<?= htmlspecialchars($base) ?>/assets/images/logo/favicon.svg">
-  <link rel="stylesheet" href="<?= htmlspecialchars($base) ?>/style.css?v=20260916d">
+  <link rel="stylesheet" href="<?= htmlspecialchars($base) ?>/style.css?v=20260918a">
   <link rel="stylesheet" href="<?= htmlspecialchars($base) ?>/ux-modern.css?v=20260916d">
 </head>
 
@@ -54,7 +54,7 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-" 
   <script nonce="<?= htmlspecialchars($cspNonce, ENT_QUOTES, 'UTF-8') ?>">window.MPL_CONFIG = <?= json_encode($publicConfig, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?>;</script>
   <script src="<?= htmlspecialchars($base) ?>/assets/vendor/qrcode.min.js"></script>
   <script src="<?= htmlspecialchars($base) ?>/assets/vendor/html5-qrcode.min.js"></script>
-  <script src="<?= htmlspecialchars($base) ?>/app.js?v=20260916d"></script>
+  <script src="<?= htmlspecialchars($base) ?>/app.js?v=20260918f"></script>
 </body>
 
 </html>
