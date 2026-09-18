@@ -3,7 +3,7 @@ $config = require __DIR__ . '/config.php';
 
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: ' . ((isset($config['cors_origin']) ? $config['cors_origin'] : '*')));
-header('Access-Control-Allow-Headers: Content-Type, Authorization, X-MPL-Token, X-MPL-Email');
+header('Access-Control-Allow-Headers: Content-Type, Authorization, X-MPL-Token, X-MPL-Participant-Token');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -88,48 +88,51 @@ function ensurePatrocinadoresSchema($db) {
 
 function ensurePagamentoSchema($db) {
     $db->exec(
-        "CREATE TABLE IF NOT EXISTS pagamentos_belluno (
+        "CREATE TABLE IF NOT EXISTS pagamentos_gateway (
             id INT UNSIGNED NOT NULL AUTO_INCREMENT,
             inscricao_id INT UNSIGNED NOT NULL,
-            metodo ENUM('PIX','CARD') NOT NULL,
-            transaction_id VARCHAR(120) NULL,
+            metodo ENUM('CHECKOUT','PIX','CARD') NOT NULL DEFAULT 'CHECKOUT',
+            payment_link_id VARCHAR(120) NULL,
+            payment_link_url VARCHAR(500) NULL,
+            order_id VARCHAR(120) NULL,
             referencia_externa VARCHAR(160) NOT NULL,
             valor DECIMAL(10,2) NOT NULL,
-            status ENUM('PENDING_PAYMENT','PROCESSING','PAID','FAILED','EXPIRED','CANCELLED','REFUNDED') NOT NULL DEFAULT 'PENDING_PAYMENT',
-            status_belluno VARCHAR(80) NULL,
-            pix_code TEXT NULL,
-            pix_expira_em DATETIME NULL,
-            erro_tecnico VARCHAR(1000) NULL,
+            status ENUM('PROCESSING','PAID','FAILED','EXPIRED','CANCELLED','REFUNDED') NOT NULL DEFAULT 'PROCESSING',
+            status_gateway VARCHAR(80) NULL,
+            checkout_expira_em DATETIME NULL,
             confirmado_em DATETIME NULL,
-            email_inscricao_em DATETIME NULL,
             email_confirmacao_em DATETIME NULL,
-            tentativas SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+            email_tentativa_em DATETIME NULL,
+            tentativas_email SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+            ultimo_erro_email VARCHAR(255) NULL,
+            erro_tecnico VARCHAR(1000) NULL,
             criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            atualizado_em TIMESTAMP NOT NULL DEFAULT '1970-01-01 00:00:01',
+            atualizado_em DATETIME NULL,
             PRIMARY KEY (id),
-            UNIQUE KEY uq_pagamentos_belluno_inscricao (inscricao_id),
-            UNIQUE KEY uq_pagamentos_belluno_transaction (transaction_id),
-            KEY idx_pagamentos_belluno_status (status),
-            KEY idx_pagamentos_belluno_referencia (referencia_externa),
-            CONSTRAINT fk_pagamentos_belluno_inscricao FOREIGN KEY (inscricao_id) REFERENCES inscricoes(id)
+            UNIQUE KEY uq_pg_inscricao (inscricao_id),
+            UNIQUE KEY uq_pg_link (payment_link_id),
+            KEY idx_pg_referencia (referencia_externa),
+            CONSTRAINT fk_pg_inscricao FOREIGN KEY (inscricao_id) REFERENCES inscricoes(id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     );
-
-    $columns = [];
-    foreach ($db->query('SHOW COLUMNS FROM pagamentos_belluno')->fetchAll() as $column) {
-        $columns[(string) $column['Field']] = true;
-    }
-    foreach (['email_inscricao_em', 'email_confirmacao_em'] as $column) {
-        if (empty($columns[$column])) {
-            $db->exec("ALTER TABLE pagamentos_belluno ADD COLUMN $column DATETIME NULL AFTER confirmado_em");
-        }
-    }
+    $columns = array();
+    foreach ($db->query('SHOW COLUMNS FROM pagamentos_gateway')->fetchAll() as $column) $columns[(string)$column['Field']] = true;
+    if (empty($columns['email_tentativa_em'])) $db->exec('ALTER TABLE pagamentos_gateway ADD COLUMN email_tentativa_em DATETIME NULL AFTER email_confirmacao_em');
+    if (empty($columns['tentativas_email'])) $db->exec('ALTER TABLE pagamentos_gateway ADD COLUMN tentativas_email SMALLINT UNSIGNED NOT NULL DEFAULT 0 AFTER email_tentativa_em');
+    if (empty($columns['ultimo_erro_email'])) $db->exec('ALTER TABLE pagamentos_gateway ADD COLUMN ultimo_erro_email VARCHAR(255) NULL AFTER tentativas_email');
 }
 
 function ensureConvitesColaboradoresSchema($db) {
     $registrationColumns = array();
     foreach ($db->query('SHOW COLUMNS FROM inscricoes')->fetchAll() as $column) $registrationColumns[(string)$column['Field']] = true;
     if (empty($registrationColumns['tipo'])) $db->exec("ALTER TABLE inscricoes ADD COLUMN tipo VARCHAR(30) NOT NULL DEFAULT 'publico' AFTER status");
+    $ticketColumns = array();
+    foreach ($db->query('SHOW COLUMNS FROM tickets')->fetchAll() as $column) $ticketColumns[(string)$column['Field']] = true;
+    if (empty($ticketColumns['qr_code_data'])) $db->exec("ALTER TABLE tickets ADD COLUMN qr_code_data VARCHAR(255) NULL AFTER token");
+    $paymentColumns = array();
+    foreach ($db->query('SHOW COLUMNS FROM pagamentos')->fetchAll() as $column) $paymentColumns[(string)$column['Field']] = (string)$column['Type'];
+    if (isset($paymentColumns['metodo']) && strpos($paymentColumns['metodo'], "'isento'") === false) $db->exec("ALTER TABLE pagamentos MODIFY metodo ENUM('pix','cartao','boleto','outro','isento') NOT NULL DEFAULT 'pix'");
+    if (isset($paymentColumns['status']) && strpos($paymentColumns['status'], "'isento'") === false) $db->exec("ALTER TABLE pagamentos MODIFY status ENUM('pendente','processando','aprovado','recusado','expirado','cancelado','estornado','isento') NOT NULL DEFAULT 'pendente'");
     $db->exec(
         "CREATE TABLE IF NOT EXISTS convites_colaboradores (
             id INT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -154,6 +157,118 @@ function ensureConvitesColaboradoresSchema($db) {
             KEY idx_convites_status (utilizado_em, cancelado_em, expira_em)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
     );
+}
+
+function ensureSecuritySchema($db) {
+    $db->exec("CREATE TABLE IF NOT EXISTS participante_codigos_acesso (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        email VARCHAR(180) NOT NULL,
+        codigo_hash CHAR(64) NOT NULL,
+        expira_em DATETIME NOT NULL,
+        tentativas TINYINT UNSIGNED NOT NULL DEFAULT 0,
+        utilizado_em DATETIME NULL,
+        criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_codigo_email (email, criado_em),
+        KEY idx_codigo_expira (expira_em)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $db->exec("CREATE TABLE IF NOT EXISTS participante_sessoes (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        token_hash CHAR(64) NOT NULL,
+        email VARCHAR(180) NOT NULL,
+        expira_em DATETIME NOT NULL,
+        revogado_em DATETIME NULL,
+        ultimo_acesso_em DATETIME NULL,
+        criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        UNIQUE KEY uq_participante_token (token_hash),
+        KEY idx_sessao_email (email),
+        KEY idx_sessao_expira (expira_em)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $db->exec("CREATE TABLE IF NOT EXISTS limites_requisicao (
+        chave_hash CHAR(64) NOT NULL,
+        acao VARCHAR(60) NOT NULL,
+        janela_inicio DATETIME NOT NULL,
+        tentativas SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+        bloqueado_ate DATETIME NULL,
+        atualizado_em DATETIME NOT NULL,
+        PRIMARY KEY (chave_hash),
+        KEY idx_limite_atualizado (atualizado_em)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+}
+
+function clientIp() {
+    return substr((string) (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : ''), 0, 45);
+}
+
+function auditLog($db, $userId, $action, $table, $recordId, $description) {
+    try {
+        $q = $db->prepare('INSERT INTO logs_auditoria (usuario_id, acao, tabela_afetada, registro_id, descricao, ip) VALUES (?, ?, ?, ?, ?, ?)');
+        $q->execute(array($userId ?: null, substr($action, 0, 80), $table ?: null, $recordId ?: null, substr((string)$description, 0, 1000), clientIp()));
+    } catch (Exception $ignored) {
+        // Uma falha de auditoria não deve expor detalhes internos ao usuário.
+    }
+}
+
+function rateLimit($db, $config, $action, $identifier, $maxAttempts, $windowSeconds, $blockSeconds) {
+    $key = hash_hmac('sha256', $action . '|' . strtolower(trim((string)$identifier)), $config['jwt_secret']);
+    $q = $db->prepare('SELECT * FROM limites_requisicao WHERE chave_hash = ? LIMIT 1');
+    $q->execute(array($key));
+    $row = $q->fetch();
+    $now = time();
+    if ($row && $row['bloqueado_ate'] && strtotime($row['bloqueado_ate']) > $now) {
+        resposta(array('error' => 'Muitas tentativas. Aguarde alguns minutos e tente novamente.'), 429);
+    }
+    if (!$row || strtotime($row['janela_inicio']) <= $now - $windowSeconds) {
+        $q = $db->prepare('REPLACE INTO limites_requisicao (chave_hash, acao, janela_inicio, tentativas, bloqueado_ate, atualizado_em) VALUES (?, ?, NOW(), 1, NULL, NOW())');
+        $q->execute(array($key, $action));
+        return $key;
+    }
+    $attempts = (int)$row['tentativas'] + 1;
+    $blockedUntil = $attempts > $maxAttempts ? date('Y-m-d H:i:s', $now + $blockSeconds) : null;
+    $q = $db->prepare('UPDATE limites_requisicao SET tentativas = ?, bloqueado_ate = ?, atualizado_em = NOW() WHERE chave_hash = ?');
+    $q->execute(array($attempts, $blockedUntil, $key));
+    if ($blockedUntil !== null) resposta(array('error' => 'Muitas tentativas. Aguarde alguns minutos e tente novamente.'), 429);
+    return $key;
+}
+
+function rateLimitClear($db, $key) {
+    if ($key) $db->prepare('DELETE FROM limites_requisicao WHERE chave_hash = ?')->execute(array($key));
+}
+
+function participantSessionCreate($db, $email) {
+    $token = bin2hex(random_bytes(32));
+    $q = $db->prepare('INSERT INTO participante_sessoes (token_hash, email, expira_em) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 12 HOUR))');
+    $q->execute(array(hash('sha256', $token), strtolower(trim($email))));
+    return $token;
+}
+
+function participantSessionEmail($db, $required = true) {
+    $token = trim((string)(isset($_SERVER['HTTP_X_MPL_PARTICIPANT_TOKEN']) ? $_SERVER['HTTP_X_MPL_PARTICIPANT_TOKEN'] : ''));
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        if ($required) resposta(array('error' => 'Confirme seu e-mail para acessar a inscrição.'), 401);
+        return null;
+    }
+    $q = $db->prepare('SELECT id, email FROM participante_sessoes WHERE token_hash = ? AND revogado_em IS NULL AND expira_em > NOW() LIMIT 1');
+    $q->execute(array(hash('sha256', $token))); $row = $q->fetch();
+    if (!$row) {
+        if ($required) resposta(array('error' => 'Seu acesso expirou. Confirme o e-mail novamente.'), 401);
+        return null;
+    }
+    $db->prepare('UPDATE participante_sessoes SET ultimo_acesso_em = NOW() WHERE id = ?')->execute(array((int)$row['id']));
+    return strtolower(trim((string)$row['email']));
+}
+
+function cpfValido($cpf) {
+    $cpf = preg_replace('/\D/', '', (string)$cpf);
+    if (strlen($cpf) !== 11 || preg_match('/^(\d)\1{10}$/', $cpf)) return false;
+    for ($digit = 9; $digit < 11; $digit++) {
+        $sum = 0;
+        for ($i = 0; $i < $digit; $i++) $sum += (int)$cpf[$i] * (($digit + 1) - $i);
+        $check = (10 * $sum) % 11; if ($check === 10) $check = 0;
+        if ((int)$cpf[$digit] !== $check) return false;
+    }
+    return true;
 }
 
 function conviteCriptografar($token, $secret) {
@@ -218,9 +333,8 @@ function enviarIngressoMpl($db, $config, $registrationId, $collaborator) {
     $png = qrPngMpl($token); $boundary = 'MPL_' . bin2hex(random_bytes(10));
     $intro = $collaborator ? 'Sua inscrição como Colaborador MPL está confirmada e isenta de pagamento.' : 'Seu pagamento foi confirmado.';
     $message = "Olá, {$r['nome_completo']}!\n\n$intro\n\nNúmero: {$r['numero']}\nCategoria: {$r['categoria_nome']}\nDistância: {$r['distancia_km']} km\nCódigo: $token\n\nApresente o QR Code anexado na retirada do kit e no check-in.";
-    $headers = array('From: 4ª Corrida MPL <' . $from . '>', 'Reply-To: ' . $from, 'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="' . $boundary . '"');
     $body = '--' . $boundary . "\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" . chunk_split(base64_encode($message)) . '--' . $boundary . "\r\nContent-Type: image/png; name=\"ingresso-corrida-mpl.png\"\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"ingresso-corrida-mpl.png\"\r\n\r\n" . chunk_split(base64_encode($png)) . '--' . $boundary . "--\r\n";
-    return @mail($r['email'], '=?UTF-8?B?' . base64_encode('Inscrição confirmada e ingresso, 4ª Corrida MPL') . '?=', $body, implode("\r\n", $headers));
+    return mplMailSend($config, $r['email'], 'Inscrição confirmada e ingresso, 4ª Corrida MPL', $body, 'multipart/mixed; boundary="' . $boundary . '"');
 }
 
 function enviarEmailCorredor($c, $to, $subject, $message) {
@@ -234,14 +348,8 @@ function enviarEmailCorredor($c, $to, $subject, $message) {
     if (!filter_var($from, FILTER_VALIDATE_EMAIL)) {
         return false;
     }
-    $headers = [
-        'From: 4ª Corrida MPL <' . $from . '>',
-        'Reply-To: ' . $from,
-        'Content-Type: text/plain; charset=UTF-8',
-        'MIME-Version: 1.0'
-    ];
-    $sent = @mail($to, '=?UTF-8?B?' . base64_encode($subject) . '?=', $message, implode("\r\n", $headers));
-    bellunoLog($sent ? 'email_sent' : 'email_failed', ['to' => $to, 'subject' => $subject]);
+    $sent = mplMailSend($c, $to, $subject, $message, 'text/plain; charset=UTF-8');
+    error_log('[MPL Mail] ' . ($sent ? 'email_sent' : 'email_failed'));
     return $sent;
 }
 
@@ -266,250 +374,8 @@ function emailPagamentoConfirmado($registration) {
         . "4ª Corrida MPL";
 }
 
-function bellunoLog($event, $context = []) {
-    $safe = [];
-    foreach ($context as $key => $value) {
-        if (in_array(strtolower((string) $key), ['token', 'authorization', 'card_hash', 'card_number', 'card_cvv', 'card_expiration_date'], true)) {
-            continue;
-        }
-        $safe[$key] = is_scalar($value) || $value === null ? $value : '[omitted]';
-    }
-    error_log('[MPL Belluno] ' . json_encode(['event' => $event, 'context' => $safe], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-}
-
-function bellunoBaseUrl($c) {
-    $custom = trim((string) ((isset($c['belluno_base_url']) ? $c['belluno_base_url'] : '')));
-    if ($custom !== '') {
-        return rtrim($custom, '/');
-    }
-
-    return strtolower((string) ((isset($c['belluno_env']) ? $c['belluno_env'] : 'sandbox'))) === 'production'
-        ? 'https://api.belluno.digital/v2'
-        : 'https://api-sandbox.belluno.digital/v2';
-}
-
-function bellunoRequest($c, $method, $path, $payload = null) {
-    $token = trim((string) ((isset($c['belluno_token']) ? $c['belluno_token'] : '')));
-    if ($token === '') {
-        throw new RuntimeException('Pagamento ainda não configurado no servidor.');
-    }
-
-    $ch = curl_init(bellunoBaseUrl($c) . '/' . ltrim($path, '/'));
-    if ($ch === false) {
-        throw new RuntimeException('Não foi possível preparar a comunicação com a Belluno.');
-    }
-
-    $headers = [
-        'Authorization: Bearer ' . $token,
-        'Accept: application/json',
-        'Content-Type: application/json'
-    ];
-
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CUSTOMREQUEST => strtoupper($method),
-        CURLOPT_HTTPHEADER => $headers,
-        CURLOPT_CONNECTTIMEOUT => 8,
-        CURLOPT_TIMEOUT => 25,
-        CURLOPT_FOLLOWLOCATION => false
-    ]);
-
-    if ($payload !== null) {
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-    }
-
-    $raw = curl_exec($ch);
-    $curlError = curl_error($ch);
-    $httpStatus = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    bellunoLog('request', ['method' => strtoupper($method), 'path' => $path, 'http_status' => $httpStatus]);
-    if ($raw === false || $curlError !== '') {
-        bellunoLog('connection_error', ['method' => strtoupper($method), 'path' => $path]);
-        throw new RuntimeException('A Belluno não respondeu. Tente novamente.');
-    }
-
-    $body = json_decode($raw, true);
-    if (!is_array($body)) {
-        throw new RuntimeException('A Belluno retornou uma resposta inválida.');
-    }
-
-    return [
-        'http_status' => $httpStatus,
-        'body' => $body
-    ];
-}
-
-function bellunoTransaction($body) {
-    $transaction = (isset($body['transaction']) ? $body['transaction'] : $body);
-    return is_array($transaction) ? $transaction : [];
-}
-
-function bellunoTransactionId($body) {
-    $transaction = bellunoTransaction($body);
-    $id = isset($transaction['transaction_id']) ? $transaction['transaction_id']
-        : (isset($transaction['id']) ? $transaction['id']
-            : (isset($body['transaction_id']) ? $body['transaction_id']
-                : (isset($body['id']) ? $body['id'] : null)));
-    return $id === null || $id === '' ? null : (string) $id;
-}
-
-function bellunoRawStatus($body) {
-    $transaction = bellunoTransaction($body);
-    return trim((string) (isset($transaction['status']) ? $transaction['status'] : (isset($body['status']) ? $body['status'] : '')));
-}
-
-function bellunoPixNormalize($value) {
-    $text = trim($value);
-    if ($text === '') {
-        return $text;
-    }
-    // O "copia e cola" (BR Code) sempre inicia com 000201.
-    if (stripos($text, '000201') === 0) {
-        return $text;
-    }
-    // Alguns retornos vêm em Base64; decodifica quando o conteúdo é um BR Code.
-    $decoded = base64_decode($text, true);
-    if ($decoded !== false && stripos(ltrim($decoded), '000201') === 0) {
-        return trim($decoded);
-    }
-    return $text;
-}
-
-function bellunoPixCode($body) {
-    $transaction = bellunoTransaction($body);
-
-    // Formato oficial: transaction.pix.base64_text (código) e base64_image (QR).
-    $pix = (isset($transaction['pix']) ? $transaction['pix'] : null);
-    if (is_array($pix)) {
-        foreach (['base64_text', 'copy_paste', 'emv', 'qr_code', 'qrcode', 'pix_code', 'code'] as $key) {
-            if (!empty($pix[$key])) {
-                return bellunoPixNormalize((string) $pix[$key]);
-            }
-        }
-    }
-
-    // Compatibilidade com formatos alternativos.
-    if (!empty($transaction['pix_code'])) {
-        return bellunoPixNormalize((string) $transaction['pix_code']);
-    }
-    $payments = (isset($transaction['payments']) ? $transaction['payments'] : []);
-    if (is_array($payments)) {
-        foreach ($payments as $payment) {
-            if (is_array($payment) && !empty($payment['pix_code'])) {
-                return bellunoPixNormalize((string) $payment['pix_code']);
-            }
-        }
-    }
-    return null;
-}
-
-function bellunoPixImage($body) {
-    $transaction = bellunoTransaction($body);
-    $pix = (isset($transaction['pix']) ? $transaction['pix'] : null);
-    if (is_array($pix)) {
-        foreach (['base64_image', 'qr_code_image', 'image'] as $key) {
-            if (!empty($pix[$key])) {
-                $img = trim((string) $pix[$key]);
-                return str_starts_with($img, 'data:') ? $img : ('data:image/png;base64,' . $img);
-            }
-        }
-    }
-    return null;
-}
-
-function bellunoLocalStatus($raw) {
-    $value = strtolower(trim($raw));
-    if (in_array($value, ['paid', 'approved', 'captured', 'succeeded', 'success'], true)) {
-        return 'PAID';
-    }
-    if (in_array($value, ['refused', 'refuse', 'declined', 'denied', 'failed', 'failure'], true)) {
-        return 'FAILED';
-    }
-    if (in_array($value, ['expired', 'closure by deadline'], true)) {
-        return 'EXPIRED';
-    }
-    if (in_array($value, ['cancelled', 'canceled', 'closure by request', 'closure requested'], true)) {
-        return 'CANCELLED';
-    }
-    return 'PROCESSING';
-}
-
-function paymentView($row) {
-    return [
-        'id' => (int) $row['id'],
-        'method' => $row['metodo'],
-        'transaction_id' => $row['transaction_id'],
-        'value_cents' => (int) round(((float) $row['valor']) * 100),
-        'status' => $row['status'],
-        'belluno_status' => $row['status_belluno'],
-        'pix_code' => $row['pix_code'],
-        'confirmed_at' => $row['confirmado_em']
-    ];
-}
-
-function loadPayment($db, $registrationId) {
-    $q = $db->prepare('SELECT * FROM pagamentos_belluno WHERE inscricao_id = ? LIMIT 1');
-    $q->execute([$registrationId]);
-    return $q->fetch() ?: null;
-}
-
-function applyBellunoStatus($db, $config, $paymentId, $body) {
-    $q = $db->prepare('SELECT * FROM pagamentos_belluno WHERE id = ? FOR UPDATE');
-    $q->execute([$paymentId]);
-    $payment = $q->fetch();
-    if (!$payment) {
-        throw new RuntimeException('Pagamento não encontrado.');
-    }
-
-    $rawStatus = bellunoRawStatus($body);
-    $localStatus = bellunoLocalStatus($rawStatus);
-    $transaction = bellunoTransaction($body);
-    $remoteValue = (isset($transaction['value']) ? $transaction['value'] : null);
-    if ($remoteValue !== null && abs((float) $remoteValue - (float) $payment['valor']) > 0.01) {
-        throw new RuntimeException('O valor confirmado pela Belluno não corresponde à inscrição.');
-    }
-
-    $pixCode = bellunoPixCode($body) ?: $payment['pix_code'];
-    $confirmedAt = $localStatus === 'PAID' ? ($payment['confirmado_em'] ?: date('Y-m-d H:i:s')) : $payment['confirmado_em'];
-    $q = $db->prepare(
-        'UPDATE pagamentos_belluno
-         SET status = ?, status_belluno = ?, pix_code = ?, confirmado_em = ?, erro_tecnico = NULL, atualizado_em = NOW()
-         WHERE id = ?'
-    );
-    $q->execute([$localStatus, $rawStatus ?: null, $pixCode, $confirmedAt, $paymentId]);
-
-    if ($localStatus === 'PAID') {
-        $db->prepare("UPDATE inscricoes SET status = 'paga' WHERE id = ? AND status <> 'cancelada'")->execute([(int) $payment['inscricao_id']]);
-        if (empty($payment['email_confirmacao_em'])) {
-            $emailQuery = $db->prepare(
-                'SELECT i.numero, i.valor, p.nome_completo, p.email, c.nome AS categoria_nome, d.distancia_km
-                 FROM inscricoes i
-                 JOIN participantes p ON p.id = i.participante_id
-                 JOIN categorias c ON c.id = i.categoria_id
-                 JOIN distancias d ON d.id = i.distancia_id
-                 WHERE i.id = ? LIMIT 1'
-            );
-            $emailQuery->execute([(int) $payment['inscricao_id']]);
-            $registration = $emailQuery->fetch();
-            if ($registration && enviarEmailCorredor($config, $registration['email'], 'Pagamento confirmado, 4ª Corrida MPL', emailPagamentoConfirmado($registration))) {
-                $db->prepare('UPDATE pagamentos_belluno SET email_confirmacao_em = NOW() WHERE id = ?')->execute([$paymentId]);
-            }
-        }
-    } elseif ($localStatus !== 'PROCESSING') {
-        $db->prepare("UPDATE inscricoes SET status = 'pendente_pagamento' WHERE id = ? AND status NOT IN ('paga', 'confirmada', 'cancelada')")->execute([(int) $payment['inscricao_id']]);
-    }
-
-    $q = $db->prepare('SELECT * FROM pagamentos_belluno WHERE id = ? LIMIT 1');
-    $q->execute([$paymentId]);
-    return $q->fetch() ?: $payment;
-}
-
 function paymentOwner($db, $registrationId) {
-    $email = strtolower(trim((string) ((isset($_SERVER['HTTP_X_MPL_EMAIL']) ? $_SERVER['HTTP_X_MPL_EMAIL'] : ''))));
-    if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        resposta(['error' => 'Informe o e-mail da inscrição.'], 401);
-    }
+    $email = participantSessionEmail($db, true);
 
     $q = $db->prepare(
         'SELECT i.*, p.nome_completo, p.email, p.cpf, p.telefone, p.data_nascimento,
@@ -632,6 +498,17 @@ function exigir(
         resposta([
             'error' => 'Faça login para continuar.'
         ], 401);
+    }
+
+    if (!empty($u['sub'])) {
+        $db = banco($c);
+        $q = $db->prepare('SELECT email, perfil FROM usuarios_admin WHERE id = ? AND ativo = 1 LIMIT 1');
+        $q->execute(array((int) $u['sub']));
+        $current = $q->fetch();
+        if (!$current || strtolower(trim((string)$current['email'])) !== strtolower(trim((string)(isset($u['email']) ? $u['email'] : '')))) {
+            resposta(array('error' => 'Sessão administrativa inválida ou revogada.'), 401);
+        }
+        $u['role'] = strtoupper((string)$current['perfil']);
     }
 
     if (
@@ -772,17 +649,18 @@ try {
     ensurePagamentoSchema($db);
     ensurePatrocinadoresSchema($db);
     ensureConvitesColaboradoresSchema($db);
+    ensureSecuritySchema($db);
 
     if ($acao === 'health') {
         $db->query('SELECT 1');
 
         resposta([
-            'status' => 'healthy',
-            'database' => $config['db_database']
+            'status' => 'healthy'
         ]);
     }
 
     if ($acao === 'diagnostico') {
+        exigir($config, array('super_admin'));
         $tabelas = [
             'corridas',
             'distancias',
@@ -796,7 +674,7 @@ try {
             'checkins',
             'usuarios_admin',
             'logs_auditoria',
-            'pagamentos_belluno',
+            'pagamentos_gateway',
             'patrocinadores'
         ];
 
@@ -812,7 +690,6 @@ try {
 
         resposta([
             'status' => 'ok',
-            'banco' => $config['db_database'],
             'tabelas' => $ok
         ]);
     }
@@ -821,6 +698,52 @@ try {
         resposta(
             corrida($db, $config)
         );
+    }
+
+    if ($acao === 'request-participant-access') {
+        $email = strtolower(trim((string)(isset($dados['email']) ? $dados['email'] : '')));
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) resposta(array('error' => 'Informe um e-mail válido.'), 422);
+        rateLimit($db, $config, 'participant-ip', clientIp(), 5, 900, 900);
+        rateLimit($db, $config, 'participant-email', $email, 3, 900, 900);
+        $q = $db->prepare('SELECT p.id FROM participantes p JOIN inscricoes i ON i.participante_id = p.id WHERE LOWER(TRIM(p.email)) = ? LIMIT 1');
+        $q->execute(array($email));
+        if ($q->fetch()) {
+            $random = unpack('Nvalue', random_bytes(4));
+            $code = str_pad((string)($random['value'] % 1000000), 6, '0', STR_PAD_LEFT);
+            $codeHash = hash_hmac('sha256', $email . '|' . $code, $config['jwt_secret']);
+            $db->prepare('UPDATE participante_codigos_acesso SET utilizado_em = NOW() WHERE email = ? AND utilizado_em IS NULL')->execute(array($email));
+            $db->prepare('INSERT INTO participante_codigos_acesso (email, codigo_hash, expira_em) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE))')->execute(array($email, $codeHash));
+            $message = "Seu código de acesso à inscrição da 4ª Corrida MPL é: " . $code . "\n\nO código expira em 10 minutos. Se você não solicitou este acesso, ignore esta mensagem.";
+            enviarEmailCorredor($config, $email, 'Código de acesso, 4ª Corrida MPL', $message);
+        }
+        resposta(array('ok' => true, 'message' => 'Se houver uma inscrição para este e-mail, o código será enviado.'));
+    }
+
+    if ($acao === 'verify-participant-access') {
+        $email = strtolower(trim((string)(isset($dados['email']) ? $dados['email'] : '')));
+        $code = preg_replace('/\D/', '', (string)(isset($dados['code']) ? $dados['code'] : ''));
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($code) !== 6) resposta(array('error' => 'Código inválido ou expirado.'), 401);
+        rateLimit($db, $config, 'participant-verify-ip', clientIp(), 10, 900, 900);
+        $db->beginTransaction();
+        $q = $db->prepare('SELECT * FROM participante_codigos_acesso WHERE email = ? AND utilizado_em IS NULL AND expira_em > NOW() ORDER BY id DESC LIMIT 1 FOR UPDATE');
+        $q->execute(array($email)); $access = $q->fetch();
+        $valid = $access && (int)$access['tentativas'] < 5 && hash_equals($access['codigo_hash'], hash_hmac('sha256', $email . '|' . $code, $config['jwt_secret']));
+        if (!$valid) {
+            if ($access) $db->prepare('UPDATE participante_codigos_acesso SET tentativas = tentativas + 1 WHERE id = ?')->execute(array((int)$access['id']));
+            $db->commit();
+            resposta(array('error' => 'Código inválido ou expirado.'), 401);
+        }
+        $db->prepare('UPDATE participante_codigos_acesso SET utilizado_em = NOW() WHERE id = ?')->execute(array((int)$access['id']));
+        $token = participantSessionCreate($db, $email);
+        $db->commit();
+        auditLog($db, null, 'PARTICIPANTE_LOGIN', 'participantes', null, 'Acesso do participante confirmado por código de uso único.');
+        resposta(array('ok' => true, 'token' => $token, 'email' => $email));
+    }
+
+    if ($acao === 'participant-logout') {
+        $token = trim((string)(isset($_SERVER['HTTP_X_MPL_PARTICIPANT_TOKEN']) ? $_SERVER['HTTP_X_MPL_PARTICIPANT_TOKEN'] : ''));
+        if (preg_match('/^[a-f0-9]{64}$/', $token)) $db->prepare('UPDATE participante_sessoes SET revogado_em = NOW() WHERE token_hash = ?')->execute(array(hash('sha256', $token)));
+        resposta(array('ok' => true));
     }
 
     if ($acao === 'invitation-info') {
@@ -840,6 +763,7 @@ try {
     }
 
     if ($acao === 'sponsor-interest') {
+        rateLimit($db, $config, 'sponsor-interest', clientIp(), 5, 3600, 3600);
         $e = corrida($db, $config);
         $company = trim((string) ((isset($dados['company']) ? $dados['company'] : '')));
         $contact = trim((string) ((isset($dados['contact_name']) ? $dados['contact_name'] : '')));
@@ -875,6 +799,7 @@ try {
         $password = (string) (
             (isset($dados['password']) ? $dados['password'] : '')
         );
+        $loginLimitKey = rateLimit($db, $config, 'admin-login', clientIp() . '|' . $email, 5, 900, 900);
 
         $q = $db->prepare(
             'SELECT
@@ -903,10 +828,14 @@ try {
                 $u['senha_hash']
             )
         ) {
+            auditLog($db, $u ? (int)$u['id'] : null, 'LOGIN_FALHOU', 'usuarios_admin', $u ? (int)$u['id'] : null, 'Tentativa administrativa recusada.');
             resposta([
                 'error' => 'E-mail ou senha inválidos.'
             ], 401);
         }
+
+        rateLimitClear($db, $loginLimitKey);
+        auditLog($db, (int)$u['id'], 'LOGIN_SUCESSO', 'usuarios_admin', (int)$u['id'], 'Acesso administrativo autenticado.');
 
         $db->prepare(
             'UPDATE usuarios_admin
@@ -937,6 +866,8 @@ try {
     }
 
     if ($acao === 'create-admin') {
+        if (empty($config['allow_bootstrap_admin'])) resposta(array('error' => 'Criação inicial de administrador desativada.'), 403);
+        rateLimit($db, $config, 'create-admin', clientIp(), 3, 3600, 3600);
         $quantidade = (int) $db
             ->query(
                 'SELECT COUNT(*) FROM usuarios_admin'
@@ -948,6 +879,11 @@ try {
                 'error' => 'Já existe um administrador.'
             ], 400);
         }
+
+        $bootstrapName = trim((string)(isset($dados['name']) ? $dados['name'] : ''));
+        $bootstrapEmail = strtolower(trim((string)(isset($dados['email']) ? $dados['email'] : '')));
+        $bootstrapPassword = (string)(isset($dados['password']) ? $dados['password'] : '');
+        if (mb_strlen($bootstrapName) < 3 || !filter_var($bootstrapEmail, FILTER_VALIDATE_EMAIL) || strlen($bootstrapPassword) < 12) resposta(array('error' => 'Informe nome, e-mail válido e senha com pelo menos 12 caracteres.'), 422);
 
         $q = $db->prepare(
             "INSERT INTO usuarios_admin
@@ -969,10 +905,10 @@ try {
         );
 
         $q->execute([
-            (isset($dados['name']) ? $dados['name'] : ''),
-            (isset($dados['email']) ? $dados['email'] : ''),
+            $bootstrapName,
+            $bootstrapEmail,
             password_hash(
-                (string) ((isset($dados['password']) ? $dados['password'] : '')),
+                $bootstrapPassword,
                 PASSWORD_DEFAULT
             )
         ]);
@@ -999,15 +935,20 @@ try {
     }
 
     if ($acao === 'sponsor-logo-upload') {
-        exigir($config, ['super_admin', 'admin']);
+        $u = exigir($config, ['super_admin', 'admin']);
         $id = (int) ((isset($_POST['sponsor_id']) ? $_POST['sponsor_id'] : 0));
         $file = (isset($_FILES['logo']) ? $_FILES['logo'] : null);
         if ($id <= 0 || !is_array($file) || (isset($file['error']) ? $file['error'] : UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || (int) $file['size'] > 5 * 1024 * 1024)
             resposta(['error' => 'Logo inválida.'], 422);
         $mime = (new finfo(FILEINFO_MIME_TYPE))->file($file['tmp_name']);
         $ext = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
-        if (!isset($ext[$mime]) || @getimagesize($file['tmp_name']) === false)
+        $imageInfo = @getimagesize($file['tmp_name']);
+        if (!isset($ext[$mime]) || $imageInfo === false || (int)$imageInfo[0] > 5000 || (int)$imageInfo[1] > 5000)
             resposta(['error' => 'Envie JPG, PNG ou WebP.'], 422);
+        $event = corrida($db, $config);
+        $owner = $db->prepare('SELECT id FROM patrocinadores WHERE id = ? AND corrida_id = ? LIMIT 1');
+        $owner->execute(array($id, (int)$event['id']));
+        if (!$owner->fetch()) resposta(array('error' => 'Patrocinador não encontrado.'), 404);
         $dir = __DIR__ . '/assets/images/sponsors';
         if (!is_dir($dir))
             mkdir($dir, 0750, true);
@@ -1016,6 +957,7 @@ try {
             resposta(['error' => 'Não foi possível salvar a logo.'], 500);
         $q = $db->prepare('UPDATE patrocinadores SET logo_path = ?, atualizado_em = NOW() WHERE id = ?');
         $q->execute(['assets/images/sponsors/' . $name, $id]);
+        auditLog($db, (int)$u['sub'], 'PATROCINADOR_LOGO', 'patrocinadores', $id, 'Logo do patrocinador atualizada.');
         resposta(['ok' => true]);
     }
 
@@ -1037,6 +979,11 @@ try {
         );
 
         $what = (isset($dados['action']) ? $dados['action'] : 'overview');
+        $adminRole = strtolower((string)$u['role']);
+
+        if ($what === 'users' && $adminRole !== 'super_admin') resposta(array('error' => 'Apenas super administrador pode consultar usuários.'), 403);
+        if ($what === 'settings' && !in_array($adminRole, array('super_admin','admin'), true)) resposta(array('error' => 'Sem permissão para consultar configurações.'), 403);
+        if ($what === 'report' && !in_array($adminRole, array('super_admin','admin','financeiro','consulta'), true)) resposta(array('error' => 'Sem permissão para emitir relatórios.'), 403);
 
         if (in_array($what, array('invitations', 'invitation-options', 'create-invitation', 'cancel-invitation', 'send-invitation', 'resend-invitation-confirmation'), true)) {
             if (!in_array(strtolower((string) $u['role']), array('super_admin', 'admin'), true)) resposta(array('error' => 'Sem permissão para gerenciar convites.'), 403);
@@ -1065,13 +1012,14 @@ try {
             $token = bin2hex(random_bytes(32)); $hours = max(1, min(8760, (int) $config['invitation_expires_hours']));
             $q = $db->prepare('INSERT INTO convites_colaboradores (corrida_id,categoria_id,token_hash,token_criptografado,expira_em,criado_por) VALUES (?,?,?,?,DATE_ADD(NOW(), INTERVAL ? HOUR),?)');
             $q->execute(array($eventId, $categoryId, hash('sha256', $token), conviteCriptografar($token, $config['jwt_secret']), $hours, (int) $u['sub']));
-            resposta(array('ok' => true, 'id' => (int) $db->lastInsertId(), 'link' => conviteLink($config, $token)), 201);
+            $inviteId = (int)$db->lastInsertId(); auditLog($db, (int)$u['sub'], 'CONVITE_CRIADO', 'convites_colaboradores', $inviteId, 'Convite de colaborador criado.');
+            resposta(array('ok' => true, 'id' => $inviteId, 'link' => conviteLink($config, $token)), 201);
         }
 
         if ($what === 'cancel-invitation') {
             $id = (int) (isset($dados['id']) ? $dados['id'] : 0);
             $q = $db->prepare('UPDATE convites_colaboradores SET cancelado_em=NOW(), atualizado_em=NOW() WHERE id=? AND utilizado_em IS NULL AND cancelado_em IS NULL AND expira_em>NOW()'); $q->execute(array($id));
-            if (!$q->rowCount()) resposta(array('error' => 'Convite indisponível ou já utilizado.'), 409); resposta(array('ok' => true));
+            if (!$q->rowCount()) resposta(array('error' => 'Convite indisponível ou já utilizado.'), 409); auditLog($db, (int)$u['sub'], 'CONVITE_CANCELADO', 'convites_colaboradores', $id, 'Convite cancelado.'); resposta(array('ok' => true));
         }
 
         if ($what === 'send-invitation') {
@@ -1083,6 +1031,7 @@ try {
             $message = "Você recebeu um convite para se inscrever como Colaborador MPL.\n\nCorrida: {$invite['event_name']}\nCategoria: {$invite['category_name']} ({$invite['distancia_km']} km)\nValor: R$ 0,00 (isento)\n\nUse o link único abaixo:\n" . conviteLink($config, $token) . "\n\nO convite é pessoal e de uso único.";
             $sent = enviarEmailCorredor($config, $email, 'Convite de Colaborador MPL', $message);
             $db->prepare('UPDATE convites_colaboradores SET email_destino=?, atualizado_em=NOW() WHERE id=?')->execute(array($email, $id));
+            auditLog($db, (int)$u['sub'], 'CONVITE_ENVIADO', 'convites_colaboradores', $id, 'Convite enviado por e-mail.');
             resposta(array('ok' => true, 'email_sent' => $sent));
         }
 
@@ -1117,6 +1066,7 @@ try {
             $q->execute([$status, $notes ?: null, $published, (int) $u['sub'], $id, (int) $e['id']]);
             if ($q->rowCount() === 0)
                 resposta(['error' => 'Solicitação não encontrada.'], 404);
+            auditLog($db, (int)$u['sub'], 'PATROCINADOR_ATUALIZADO', 'patrocinadores', $id, 'Status: ' . $status . '; publicado: ' . $published . '.');
             resposta(['ok' => true, 'status' => $status, 'published' => (bool) $published]);
         }
 
@@ -1255,7 +1205,7 @@ try {
                         ELSE 'PENDING'
                     END AS status,
                     p.nome_completo AS name,
-                    p.cpf AS cpf_masked,
+                    CONCAT(LEFT(p.cpf,3), '.***.***-', RIGHT(p.cpf,2)) AS cpf_masked,
                     c.nome AS category_name,
                     p.tamanho_camiseta AS shirt_size,
                     COALESCE(
@@ -1268,7 +1218,7 @@ try {
                     ) AS checkin_at,
                     UPPER(i.tipo) AS type,
                     i.valor * 100 AS amount_cents,
-                    CASE WHEN i.tipo='colaborador_mpl' THEN 'ISENTO' ELSE CASE pb.status
+                    CASE WHEN i.tipo='colaborador_mpl' THEN 'ISENTO' WHEN i.status IN ('paga','confirmada') THEN 'APPROVED' ELSE CASE pg.status
                         WHEN 'PAID' THEN 'APPROVED'
                         WHEN 'FAILED' THEN 'DECLINED'
                         WHEN 'EXPIRED' THEN 'DECLINED'
@@ -1280,8 +1230,8 @@ try {
                    ON p.id = i.participante_id
                  JOIN categorias c
                    ON c.id = i.categoria_id
-                 LEFT JOIN pagamentos_belluno pb
-                   ON pb.inscricao_id = i.id
+                 LEFT JOIN pagamentos_gateway pg
+                   ON pg.inscricao_id = i.id
                  LEFT JOIN retiradas_kit rk
                    ON rk.inscricao_id = i.id
                  LEFT JOIN checkins ch
@@ -1446,6 +1396,8 @@ try {
                 (isset($x['max_age']) ? $x['max_age'] : 120)
             );
 
+            if ($minAge < 0 || $maxAge < $minAge || $maxAge > 120) resposta(array('error' => 'Faixa etária inválida.'), 422);
+
             $ativo = !empty(
                 $x['active']
             ) ? 1 : 0;
@@ -1494,7 +1446,10 @@ try {
                     $maxAge,
                     $ativo
                 ]);
+                $id = (int)$db->lastInsertId();
             }
+
+            auditLog($db, (int)$u['sub'], 'CATEGORIA_SALVA', 'categorias', $id, 'Categoria administrativa salva.');
 
             resposta([
                 'ok' => true
@@ -1601,7 +1556,16 @@ try {
                     $fim,
                     $ativo
                 ]);
+                $id = (int)$db->lastInsertId();
             }
+
+            if ($precoCentavos < 0) resposta(array('error' => 'O valor do lote não pode ser negativo.'), 422);
+            $categoryCheck = $db->prepare('SELECT id FROM categorias WHERE id = ? AND corrida_id = ? LIMIT 1');
+            $categoryCheck->execute(array($categoriaId, (int)$e['id']));
+            if (!$categoryCheck->fetch()) resposta(array('error' => 'Categoria inválida para esta corrida.'), 422);
+            if ($inicio && $fim && strtotime($inicio) !== false && strtotime($fim) !== false && strtotime($fim) <= strtotime($inicio)) resposta(array('error' => 'O fim do lote deve ser posterior ao início.'), 422);
+
+            auditLog($db, (int)$u['sub'], 'LOTE_SALVO', 'lotes', $id, 'Lote administrativo salvo.');
 
             resposta([
                 'ok' => true
@@ -1634,6 +1598,8 @@ try {
                 : 'rascunho',
                 $e['id']
             ]);
+
+            auditLog($db, (int)$u['sub'], 'CORRIDA_CONFIGURADA', 'corridas', (int)$e['id'], 'Configurações da corrida atualizadas.');
 
             resposta([
                 'ok' => true
@@ -1677,6 +1643,8 @@ try {
                 )
             );
 
+            if (!in_array($perfil, array('super_admin','admin','operador','financeiro','consulta'), true)) resposta(array('error' => 'Perfil inválido.'), 422);
+
             $senha = (string) (
                 (isset($x['password']) ? $x['password'] : '')
             );
@@ -1690,6 +1658,10 @@ try {
             $ativo = !empty(
                 $x['active']
             ) ? 1 : 0;
+
+            if (mb_strlen($nome) < 3 || mb_strlen($nome) > 160) resposta(array('error' => 'Informe um nome válido.'), 422);
+            if (($id <= 0 && strlen($senha) < 10) || ($senha !== '' && strlen($senha) < 10)) resposta(array('error' => 'A senha deve ter pelo menos 10 caracteres.'), 422);
+            if ($id === (int)$u['sub'] && (!$ativo || $perfil !== 'super_admin')) resposta(array('error' => 'Você não pode desativar ou reduzir o perfil da própria conta.'), 409);
 
             if ($id) {
                 $sql = '
@@ -1725,12 +1697,6 @@ try {
 
                 $q->execute($args);
             } else {
-                if ($senha === '') {
-                    $senha = bin2hex(
-                        random_bytes(8)
-                    );
-                }
-
                 $q = $db->prepare(
                     'INSERT INTO usuarios_admin
                     (
@@ -1753,7 +1719,10 @@ try {
                     $perfil,
                     $ativo
                 ]);
+                $id = (int)$db->lastInsertId();
             }
+
+            auditLog($db, (int)$u['sub'], 'USUARIO_ADMIN_SALVO', 'usuarios_admin', $id, 'Usuário administrativo salvo com perfil ' . $perfil . '.');
 
             resposta([
                 'ok' => true
@@ -1764,10 +1733,7 @@ try {
     }
 
     if ($acao === 'search-registration') {
-        $email = strtolower(trim((string) ((isset($_SERVER['HTTP_X_MPL_EMAIL']) ? $_SERVER['HTTP_X_MPL_EMAIL'] : ''))));
-        if ($email === '') {
-            resposta(null);
-        }
+        $email = participantSessionEmail($db, true);
         $registrationId = (int) ((isset($dados['registration_id']) ? $dados['registration_id'] : 0));
         $where = $registrationId > 0 ? 'i.id = ? AND LOWER(TRIM(p.email)) = ?' : 'LOWER(TRIM(p.email)) = ?';
         $args = $registrationId > 0 ? [$registrationId, $email] : [$email];
@@ -1785,7 +1751,7 @@ try {
                 i.valor * 100 AS amount_cents,
                 UPPER(i.tipo) AS type,
                 p.nome_completo AS name,
-                p.cpf,
+                CONCAT(LEFT(p.cpf,3), '.***.***-', RIGHT(p.cpf,2)) AS cpf,
                 p.email,
                 p.telefone AS phone,
                 p.data_nascimento AS birth_date,
@@ -1793,26 +1759,26 @@ try {
                 c.nome AS category_name,
                 d.distancia_km,
                 d.distancia_km AS distance_km,
-                CASE WHEN i.tipo='colaborador_mpl' THEN 'ISENTO' ELSE CASE pb.status
+                CASE WHEN i.tipo='colaborador_mpl' THEN 'ISENTO' WHEN i.status IN ('paga','confirmada') THEN 'APPROVED' ELSE CASE pg.status
                     WHEN 'PAID' THEN 'APPROVED'
                     WHEN 'FAILED' THEN 'DECLINED'
                     WHEN 'EXPIRED' THEN 'DECLINED'
                     WHEN 'CANCELLED' THEN 'DECLINED'
                     ELSE 'PENDING'
                 END END AS payment_status,
-                pb.id AS payment_id,
-                pb.metodo AS payment_method,
-                pb.transaction_id AS belluno_transaction_id,
-                pb.status AS payment_local_status,
-                pb.status_belluno AS belluno_status,
-                pb.pix_code,
+                pg.id AS payment_id,
+                pg.metodo AS payment_method,
+                pg.order_id AS gateway_order_id,
+                pg.status AS payment_local_status,
+                pg.status_gateway AS gateway_status,
+                pg.payment_link_url AS checkout_url,
                 rk.retirado_em AS kit_at,
                 ch.realizado_em AS checkin_at
              FROM inscricoes i
              JOIN participantes p ON p.id = i.participante_id
              JOIN categorias c ON c.id = i.categoria_id
              JOIN distancias d ON d.id = i.distancia_id
-             LEFT JOIN pagamentos_belluno pb ON pb.inscricao_id = i.id
+             LEFT JOIN pagamentos_gateway pg ON pg.inscricao_id = i.id
              LEFT JOIN retiradas_kit rk ON rk.inscricao_id = i.id
              LEFT JOIN checkins ch ON ch.inscricao_id = i.id
              WHERE " . $where . "
@@ -1829,8 +1795,7 @@ try {
     if ($acao === 'send-participant-email') {
         $registrationId = (int) ((isset($dados['registration_id']) ? $dados['registration_id'] : 0));
         $registration = paymentOwner($db, $registrationId);
-        $payment = loadPayment($db, $registrationId);
-        $confirmed = in_array($registration['status'], ['paga', 'confirmada'], true) || ($payment && $payment['status'] === 'PAID');
+        $confirmed = in_array($registration['status'], ['paga', 'confirmada'], true);
         $ticketToken = null;
         if ($confirmed) {
             $q = $db->prepare("SELECT token FROM tickets WHERE inscricao_id = ? AND status = 'ativo' LIMIT 1");
@@ -1891,13 +1856,19 @@ try {
         }
         $cpf = preg_replace('/\D/', '', (string) $dados['cpf']);
         $email = strtolower(trim((string) $dados['email']));
-        if (strlen($cpf) !== 11 || !filter_var($email, FILTER_VALIDATE_EMAIL)) resposta(array('error' => 'Confira o CPF e o e-mail informados.'), 422);
+        $birth = DateTime::createFromFormat('Y-m-d', (string)$dados['birth_date']);
+        $birthValid = $birth && $birth->format('Y-m-d') === (string)$dados['birth_date'] && $birth->getTimestamp() < time();
+        $shirt = strtoupper(trim((string)$dados['shirt_size']));
+        $state = strtoupper(trim((string)$dados['state']));
+        if (!cpfValido($cpf) || !filter_var($email, FILTER_VALIDATE_EMAIL)) resposta(array('error' => 'Confira o CPF e o e-mail informados.'), 422);
+        if (!$birthValid || !in_array($shirt, array('PP','P','M','G','GG','XG','XGG'), true) || !preg_match('/^[A-Z]{2}$/', $state)) resposta(array('error' => 'Confira nascimento, camiseta e estado.'), 422);
+        if (mb_strlen(trim((string)$dados['name'])) < 3 || strlen(preg_replace('/\D/','',(string)$dados['phone'])) < 10 || strlen(preg_replace('/\D/','',(string)$dados['emergency_phone'])) < 10) resposta(array('error' => 'Confira nome e telefones informados.'), 422);
 
         $db->beginTransaction();
         try {
             $invite = null;
             if ($isCollaborator) {
-                $q = $db->prepare("SELECT cv.*, co.nome AS event_name, co.status AS event_status, ca.nome AS category_name, ca.distancia_id, ca.ativa AS category_active, d.distancia_km FROM convites_colaboradores cv JOIN corridas co ON co.id=cv.corrida_id JOIN categorias ca ON ca.id=cv.categoria_id JOIN distancias d ON d.id=ca.distancia_id WHERE cv.token_hash=? FOR UPDATE");
+                $q = $db->prepare("SELECT cv.*, co.nome AS event_name, co.status AS event_status, ca.nome AS category_name, ca.distancia_id, ca.ativa AS category_active, ca.idade_minima, ca.idade_maxima, d.distancia_km FROM convites_colaboradores cv JOIN corridas co ON co.id=cv.corrida_id JOIN categorias ca ON ca.id=cv.categoria_id JOIN distancias d ON d.id=ca.distancia_id WHERE cv.token_hash=? FOR UPDATE");
                 $q->execute(array(hash('sha256', $invitationToken))); $invite = $q->fetch();
                 if (!$invite || $invite['cancelado_em'] || $invite['utilizado_em'] || strtotime($invite['expira_em']) <= time()) {
                     $db->rollBack(); resposta(array('error' => 'Este convite não está mais disponível.'), 410);
@@ -1927,17 +1898,33 @@ try {
                 $q->execute(array($dados['name'],$email,$cpf,$dados['phone'],$dados['birth_date'],$dados['gender'],$dados['shirt_size'])); $pid=(int)$db->lastInsertId();
             }
 
+            $lotId = null;
             if ($isCollaborator) {
-                $cat = array('id'=>(int)$invite['categoria_id'],'nome'=>$invite['category_name'],'distancia_id'=>(int)$invite['distancia_id'],'distancia_km'=>$invite['distancia_km'],'preco'=>0);
+                $cat = array('id'=>(int)$invite['categoria_id'],'nome'=>$invite['category_name'],'distancia_id'=>(int)$invite['distancia_id'],'distancia_km'=>$invite['distancia_km'],'preco'=>0,'idade_minima'=>$invite['idade_minima'],'idade_maxima'=>$invite['idade_maxima']);
             } else {
-                $q=$db->prepare("SELECT c.*,d.distancia_km,COALESCE((SELECT preco FROM lotes WHERE corrida_id=? AND categoria_id=c.id AND ativo=1 ORDER BY id LIMIT 1),0) AS preco FROM categorias c JOIN distancias d ON d.id=c.distancia_id WHERE c.id=? AND c.corrida_id=? AND c.ativa=1");
-                $q->execute(array($eventId,(int)$dados['category_id'],$eventId)); $cat=$q->fetch(); if(!$cat) throw new RuntimeException('Categoria inválida.');
+                $q=$db->prepare("SELECT c.*,d.distancia_km FROM categorias c JOIN distancias d ON d.id=c.distancia_id WHERE c.id=? AND c.corrida_id=? AND c.ativa=1 LIMIT 1");
+                $q->execute(array((int)$dados['category_id'],$eventId)); $cat=$q->fetch(); if(!$cat) throw new RuntimeException('Categoria inválida.');
+                $q=$db->prepare("SELECT * FROM lotes WHERE corrida_id=? AND categoria_id=? AND ativo=1 AND (inicio IS NULL OR inicio<=NOW()) AND (fim IS NULL OR fim>=NOW()) AND (quantidade=0 OR vendidos<quantidade) ORDER BY inicio,id LIMIT 1 FOR UPDATE");
+                $q->execute(array($eventId,(int)$cat['id'])); $lot=$q->fetch(); if(!$lot) throw new RuntimeException('Não há lote disponível para esta categoria.');
+                $lotId=(int)$lot['id']; $cat['preco']=$lot['preco'];
             }
+
+            $age = (int)$birth->diff(new DateTime('today'))->y;
+            if ($age < (int)$cat['idade_minima'] || $age > (int)$cat['idade_maxima']) throw new RuntimeException('A idade não atende aos critérios da categoria selecionada.');
 
             $numero='MPL'.date('Y').str_pad((string)$eventId,2,'0',STR_PAD_LEFT).str_pad((string)$pid,7,'0',STR_PAD_LEFT);
             $status=$isCollaborator?'confirmada':'pendente_pagamento'; $type=$isCollaborator?'colaborador_mpl':'publico'; $value=$isCollaborator?0:$cat['preco'];
-            $q=$db->prepare('INSERT INTO inscricoes (numero,corrida_id,participante_id,categoria_id,distancia_id,status,tipo,valor) VALUES (?,?,?,?,?,?,?,?)');
-            $q->execute(array($numero,$eventId,$pid,$cat['id'],$cat['distancia_id'],$status,$type,$value)); $id=(int)$db->lastInsertId();
+            $q=$db->prepare('INSERT INTO inscricoes (numero,corrida_id,participante_id,categoria_id,distancia_id,lote_id,status,tipo,valor) VALUES (?,?,?,?,?,?,?,?,?)');
+            $q->execute(array($numero,$eventId,$pid,$cat['id'],$cat['distancia_id'],$lotId,$status,$type,$value)); $id=(int)$db->lastInsertId();
+
+            $db->prepare('DELETE FROM enderecos WHERE participante_id=?')->execute(array($pid));
+            $db->prepare('INSERT INTO enderecos (participante_id,cep,rua,numero,complemento,bairro,cidade,estado) VALUES (?,?,?,?,?,?,?,?)')->execute(array($pid,preg_replace('/\D/','',(string)$dados['zip_code']),trim((string)$dados['street']),trim((string)$dados['address_number']),trim((string)(isset($dados['complement'])?$dados['complement']:'')) ?: null,trim((string)$dados['neighborhood']),trim((string)$dados['city']),$state));
+            $db->prepare('DELETE FROM contatos_emergencia WHERE participante_id=?')->execute(array($pid));
+            $db->prepare('INSERT INTO contatos_emergencia (participante_id,nome,telefone,parentesco) VALUES (?,?,?,?)')->execute(array($pid,trim((string)$dados['emergency_name']),trim((string)$dados['emergency_phone']),trim((string)(isset($dados['emergency_relationship'])?$dados['emergency_relationship']:'')) ?: null));
+            if (!$isCollaborator) {
+                $q=$db->prepare('UPDATE lotes SET vendidos=vendidos+1 WHERE id=? AND (quantidade=0 OR vendidos<quantidade)'); $q->execute(array($lotId));
+                if ($q->rowCount() !== 1) throw new RuntimeException('As vagas deste lote acabaram. Selecione outro lote.');
+            }
 
             if ($isCollaborator) {
                 $db->prepare("INSERT INTO pagamentos (inscricao_id,provedor,metodo,valor,status,pago_em) VALUES (?,'interno','isento',0,'isento',NOW())")->execute(array($id));
@@ -1947,13 +1934,15 @@ try {
             }
 
             $db->commit();
+            $participantToken = participantSessionCreate($db, $email);
             if ($isCollaborator) {
                 $emailSent=enviarIngressoMpl($db,$config,$id,true);
             } else {
                 $registrationEmail=array('nome_completo'=>$dados['name'],'email'=>$email,'numero'=>$numero,'categoria_nome'=>$cat['nome'],'distancia_km'=>$cat['distancia_km'],'valor'=>$value);
                 $emailSent=enviarEmailCorredor($config,$email,'Inscrição recebida, 4ª Corrida MPL',emailInscricao($registrationEmail));
             }
-            resposta(array('id'=>$id,'number'=>$numero,'email_sent'=>$emailSent,'type'=>strtoupper($type),'payment_status'=>$isCollaborator?'ISENTO':'PENDING','is_collaborator'=>$isCollaborator));
+            auditLog($db, null, 'INSCRICAO_CRIADA', 'inscricoes', $id, $isCollaborator ? 'Inscrição de colaborador criada por convite.' : 'Inscrição pública criada.');
+            resposta(array('id'=>$id,'number'=>$numero,'email_sent'=>$emailSent,'type'=>strtoupper($type),'payment_status'=>$isCollaborator?'ISENTO':'PENDING','is_collaborator'=>$isCollaborator,'participant_token'=>$participantToken,'participant_email'=>$email));
         } catch (Exception $z) {
             if ($db->inTransaction()) $db->rollBack();
             throw $z;
@@ -1961,8 +1950,6 @@ try {
     }
 
     if ($acao === 'generate-ticket') {
-        exigir($config);
-
         $id = (int) (
             (isset($dados['registration_id']) ? $dados['registration_id'] : 0)
         );
@@ -1971,11 +1958,19 @@ try {
             resposta(['error' => 'Inscrição inválida.'], 422);
         }
 
+        $admin = usuarioAtual($config);
+        if (!$admin) {
+            $participantEmail = participantSessionEmail($db, true);
+            $ownerQuery = $db->prepare('SELECT i.id FROM inscricoes i JOIN participantes p ON p.id = i.participante_id WHERE i.id = ? AND LOWER(TRIM(p.email)) = ? LIMIT 1');
+            $ownerQuery->execute(array($id, $participantEmail));
+            if (!$ownerQuery->fetch()) resposta(array('error' => 'Você não tem acesso a esta inscrição.'), 403);
+        }
+
         // O ticket só é emitido após a confirmação do pagamento.
         $statusQuery = $db->prepare(
-            "SELECT i.status, pb.status AS pagamento
+            "SELECT i.status, pg.status AS pagamento
              FROM inscricoes i
-             LEFT JOIN pagamentos_belluno pb ON pb.inscricao_id = i.id
+             LEFT JOIN pagamentos_gateway pg ON pg.inscricao_id = i.id
              WHERE i.id = ? LIMIT 1"
         );
         $statusQuery->execute([$id]);
@@ -2051,226 +2046,8 @@ try {
 
     require __DIR__ . '/pagarme_checkout.php';
 
-    if (in_array($acao, ['card-hash-key', 'create-payment', 'belluno-webhook'], true)) {
+    if (in_array($acao, ['card-hash-key', 'create-payment', 'payment-status', 'belluno-webhook'], true)) {
         resposta(['error' => 'Integração Belluno desativada. Utilize o Checkout Pagar.me/Stone.'], 410);
-    }
-
-    if ($acao === 'card-hash-key') {
-        $result = bellunoRequest($config, 'GET', '/transaction/card_hash_key');
-        if ($result['http_status'] < 200 || $result['http_status'] >= 300) {
-            resposta(['error' => 'Não foi possível preparar o cartão para pagamento.'], 400);
-        }
-        $body = $result['body'];
-        if (empty($body['id']) || empty($body['rsa_public_key'])) {
-            resposta(['error' => 'A Belluno não forneceu uma chave válida para o cartão.'], 400);
-        }
-        resposta([
-            'id' => (string) $body['id'],
-            'rsa_public_key' => (string) $body['rsa_public_key'],
-            'created_at' => (isset($body['created_at']) ? $body['created_at'] : null)
-        ]);
-    }
-
-    if ($acao === 'create-payment') {
-        $registrationId = (int) ((isset($dados['registration_id']) ? $dados['registration_id'] : 0));
-        $method = strtoupper(trim((string) ((isset($dados['method']) ? $dados['method'] : ''))));
-        if ($registrationId <= 0 || !in_array($method, ['PIX', 'CARD'], true)) {
-            resposta(['error' => 'Selecione uma inscrição e um método de pagamento válido.'], 422);
-        }
-        $registration = paymentOwner($db, $registrationId);
-        if (in_array($registration['status'], ['paga', 'confirmada'], true)) {
-            resposta(['error' => 'Esta inscrição já está confirmada.'], 409);
-        }
-
-        $payment = loadPayment($db, $registrationId);
-        if ($payment && $payment['status'] === 'PAID') {
-            resposta(['payment' => paymentView($payment)]);
-        }
-        if ($payment && in_array($payment['status'], ['PENDING_PAYMENT', 'PROCESSING'], true) && ($payment['transaction_id'] || $payment['status'] === 'PROCESSING')) {
-            if ($payment['metodo'] !== $method) {
-                resposta(['error' => 'Já existe uma cobrança pendente para esta inscrição. Aguarde a confirmação ou use a mesma forma de pagamento.'], 409);
-            }
-            resposta(['payment' => paymentView($payment)]);
-        }
-
-        $reference = 'MPL-' . $registration['numero'] . '-' . $method;
-        $db->beginTransaction();
-        try {
-            $payment = loadPayment($db, $registrationId);
-            if (!$payment) {
-                $q = $db->prepare(
-                    "INSERT INTO pagamentos_belluno (inscricao_id, metodo, referencia_externa, valor, status, tentativas)
-                     VALUES (?, ?, ?, ?, 'PROCESSING', 1)"
-                );
-                $q->execute([$registrationId, $method, $reference, (float) $registration['valor']]);
-            } else {
-                $q = $db->prepare(
-                    "UPDATE pagamentos_belluno SET metodo = ?, referencia_externa = ?, valor = ?, transaction_id = NULL, pix_code = NULL, status = 'PROCESSING', status_belluno = NULL, erro_tecnico = NULL, confirmado_em = NULL, tentativas = tentativas + 1, atualizado_em = NOW() WHERE id = ?"
-                );
-                $q->execute([$method, $reference, (float) $registration['valor'], (int) $payment['id']]);
-            }
-            $db->commit();
-        } catch (Exception $z) {
-            if ($db->inTransaction())
-                $db->rollBack();
-            if ($z instanceof PDOException && $z->getCode() === '23000') {
-                $existing = loadPayment($db, $registrationId);
-                if ($existing)
-                    resposta(['payment' => paymentView($existing)]);
-            }
-            throw $z;
-        }
-        $payment = loadPayment($db, $registrationId);
-
-        $value = (float) $registration['valor'];
-        $cart = [
-            [
-                'product_name' => 'Inscrição 4ª Corrida MPL',
-                'quantity' => 1,
-                'unit_value' => $value
-            ]
-        ];
-        if ($method === 'PIX') {
-            $transaction = [
-                'value' => $value,
-                'client_name' => $registration['nome_completo'],
-                'client_document' => $registration['cpf'],
-                'client_email' => $registration['email'],
-                'client_phone' => $registration['telefone'],
-                'client_cellphone' => $registration['telefone'],
-                'details' => 'Inscrição ' . $registration['numero'],
-                'cart' => $cart
-            ];
-        } else {
-            $cardHash = trim((string) ((isset($dados['card_hash']) ? $dados['card_hash'] : '')));
-            $visitorId = trim((string) ((isset($config['belluno_visitor_id']) ? $config['belluno_visitor_id'] : '')));
-            $brand = (int) ((isset($dados['brand']) ? $dados['brand'] : 0));
-            $installments = (int) ((isset($dados['installment_number']) ? $dados['installment_number'] : 0));
-            if (!in_array($brand, [1, 2, 3, 4, 5, 6, 7], true) || $installments < 1 || $installments > 12) {
-                resposta(['error' => 'Bandeira ou quantidade de parcelas inválida.'], 422);
-            }
-            if ($cardHash === '' || $visitorId === '') {
-                $db->prepare("UPDATE pagamentos_belluno SET status = 'FAILED', erro_tecnico = ?, atualizado_em = NOW() WHERE id = ?")->execute(['Dados de cartão ou visitor_id não configurados.', (int) $payment['id']]);
-                resposta(['error' => 'O pagamento por cartão ainda não está pronto para este ambiente.'], 422);
-            }
-            $billing = is_array((isset($dados['billing']) ? $dados['billing'] : null)) ? $dados['billing'] : [];
-            foreach (['postalCode', 'street', 'number', 'city', 'state'] as $field) {
-                if (trim((string) ((isset($billing[$field]) ? $billing[$field] : ''))) === '') {
-                    resposta(['error' => 'Preencha o endereço de cobrança para pagar com cartão.'], 422);
-                }
-            }
-            $birth = (string) ((isset($dados['cardholder_birth']) ? $dados['cardholder_birth'] : $registration['data_nascimento']));
-            $birthTimestamp = strtotime($birth);
-            $birthBelluno = $birthTimestamp ? date('d/m/Y', $birthTimestamp) : $birth;
-            $transaction = [
-                'value' => $value,
-                'card_hash' => $cardHash,
-                'cardholder_name' => trim((string) ((isset($dados['cardholder_name']) ? $dados['cardholder_name'] : $registration['nome_completo']))),
-                'cardholder_document' => preg_replace('/\D/', '', (string) ((isset($dados['cardholder_document']) ? $dados['cardholder_document'] : $registration['cpf']))),
-                'cardholder_cellphone' => $registration['telefone'],
-                'cardholder_birth' => $birthBelluno,
-                'brand' => $brand,
-                'installment_number' => $installments,
-                'visitor_id' => $visitorId,
-                'payer_ip' => (isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '0.0.0.0'),
-                'client_name' => $registration['nome_completo'],
-                'client_document' => $registration['cpf'],
-                'client_email' => $registration['email'],
-                'client_cellphone' => $registration['telefone'],
-                'billing' => [
-                    'postalCode' => trim((string) $billing['postalCode']),
-                    'street' => trim((string) $billing['street']),
-                    'number' => trim((string) $billing['number']),
-                    'city' => trim((string) $billing['city']),
-                    'state' => strtoupper(trim((string) $billing['state']))
-                ],
-                'cart' => $cart
-            ];
-        }
-        $postbackUrl = trim((string) ((isset($config['belluno_postback_url']) ? $config['belluno_postback_url'] : '')));
-        if ($postbackUrl !== '')
-            $transaction['postback'] = ['url' => $postbackUrl];
-
-        try {
-            $result = bellunoRequest($config, 'POST', $method === 'PIX' ? '/transaction/pix' : '/transaction/async', ['transaction' => $transaction]);
-            if ($result['http_status'] < 200 || $result['http_status'] >= 300) {
-                throw new RuntimeException('A Belluno recusou a cobrança.');
-            }
-            $body = $result['body'];
-            $transactionId = bellunoTransactionId($body);
-            if ($transactionId === null)
-                throw new RuntimeException('A Belluno não retornou o identificador da transação.');
-            $rawStatus = bellunoRawStatus($body);
-            $localStatus = bellunoLocalStatus($rawStatus);
-            $pixCode = bellunoPixCode($body);
-            $q = $db->prepare('UPDATE pagamentos_belluno SET transaction_id = ?, status = ?, status_belluno = ?, pix_code = ?, erro_tecnico = NULL, atualizado_em = NOW() WHERE id = ?');
-            $q->execute([$transactionId, $localStatus, $rawStatus ?: null, $pixCode, (int) $payment['id']]);
-            if ($localStatus === 'PAID') {
-                $db->prepare("UPDATE inscricoes SET status = 'paga' WHERE id = ? AND status <> 'cancelada'")->execute([$registrationId]);
-            }
-            $payment = loadPayment($db, $registrationId);
-            resposta(['payment' => paymentView($payment)]);
-        } catch (Exception $z) {
-            $db->prepare("UPDATE pagamentos_belluno SET status = 'FAILED', erro_tecnico = ?, atualizado_em = NOW() WHERE id = ?")->execute([mb_substr($z->getMessage(), 0, 1000), (int) $payment['id']]);
-            resposta(['error' => $z->getMessage()], 400);
-        }
-    }
-
-    if ($acao === 'payment-status') {
-        $registrationId = (int) ((isset($dados['registration_id']) ? $dados['registration_id'] : 0));
-        $registration = paymentOwner($db, $registrationId);
-        $payment = loadPayment($db, $registrationId);
-        if (!$payment)
-            resposta(['error' => 'Nenhuma cobrança foi criada para esta inscrição.'], 404);
-        if ($payment['transaction_id'] && in_array($payment['status'], ['PENDING_PAYMENT', 'PROCESSING'], true)) {
-            $path = $payment['metodo'] === 'PIX'
-                ? '/transaction/' . rawurlencode((string) $payment['transaction_id']) . '/pix'
-                : '/transaction/' . rawurlencode((string) $payment['transaction_id']);
-            try {
-                $result = bellunoRequest($config, 'GET', $path);
-                if ($result['http_status'] >= 200 && $result['http_status'] < 300) {
-                    $db->beginTransaction();
-                    try {
-                        $payment = applyBellunoStatus($db, $config, (int) $payment['id'], $result['body']);
-                        $db->commit();
-                    } catch (Exception $z) {
-                        if ($db->inTransaction())
-                            $db->rollBack();
-                        throw $z;
-                    }
-                }
-            } catch (Exception $z) {
-                resposta(['error' => 'Não foi possível consultar o status agora.'], 400);
-            }
-        }
-        resposta(['payment' => paymentView($payment)]);
-    }
-
-    if ($acao === 'belluno-webhook') {
-        $secret = trim((string) ((isset($config['belluno_postback_secret']) ? $config['belluno_postback_secret'] : '')));
-        $providedSecret = trim((string) ((isset($_SERVER['HTTP_X_BELLUNO_WEBHOOK_SECRET']) ? $_SERVER['HTTP_X_BELLUNO_WEBHOOK_SECRET'] : '')));
-        if ($secret !== '' && !hash_equals($secret, $providedSecret))
-            resposta(['error' => 'Postback não autorizado.'], 401);
-        $body = $dados;
-        bellunoLog('webhook_received', ['has_transaction' => bellunoTransactionId($body) !== null]);
-        $transactionId = bellunoTransactionId($body);
-        if ($transactionId === null)
-            resposta(['error' => 'Transação não informada.'], 422);
-        $q = $db->prepare('SELECT id, valor FROM pagamentos_belluno WHERE transaction_id = ? LIMIT 1');
-        $q->execute([$transactionId]);
-        $payment = $q->fetch();
-        if (!$payment)
-            resposta(['error' => 'Transação não encontrada.'], 404);
-        $db->beginTransaction();
-        try {
-            $updated = applyBellunoStatus($db, $config, (int) $payment['id'], $body);
-            $db->commit();
-            resposta(['ok' => true, 'status' => $updated['status']]);
-        } catch (Exception $z) {
-            if ($db->inTransaction())
-                $db->rollBack();
-            resposta(['error' => 'Postback rejeitado.'], 422);
-        }
     }
 
     if ($acao === 'validate-ticket') {
@@ -2304,7 +2081,7 @@ try {
                     ELSE 'PENDING'
                 END AS status,
                 p.nome_completo AS name,
-                p.cpf,
+                CONCAT(LEFT(p.cpf,3), '.***.***-', RIGHT(p.cpf,2)) AS cpf_masked,
                 c.nome AS category_name,
                 p.tamanho_camiseta AS shirt_size,
                 t.token,
@@ -2313,8 +2090,8 @@ try {
                 UPPER(i.tipo) AS type,
                 CASE
                     WHEN i.tipo='colaborador_mpl' THEN 'ISENTO'
-                    WHEN i.status IN ('paga','confirmada') OR pb.status = 'PAID' THEN 'APPROVED'
-                    WHEN pb.status IN ('FAILED','EXPIRED','CANCELLED') THEN 'DECLINED'
+                    WHEN i.status IN ('paga','confirmada') OR pg.status = 'PAID' THEN 'APPROVED'
+                    WHEN pg.status IN ('FAILED','EXPIRED','CANCELLED') THEN 'DECLINED'
                     ELSE 'PENDING'
                 END AS payment_status
              FROM tickets t
@@ -2324,8 +2101,8 @@ try {
                ON p.id = i.participante_id
              JOIN categorias c
                ON c.id = i.categoria_id
-             LEFT JOIN pagamentos_belluno pb
-               ON pb.inscricao_id = i.id
+             LEFT JOIN pagamentos_gateway pg
+               ON pg.inscricao_id = i.id
              LEFT JOIN retiradas_kit rk
                ON rk.inscricao_id = i.id
              LEFT JOIN checkins ch
@@ -2373,10 +2150,10 @@ try {
         if ($acao === 'withdraw-kit') {
             $info = $db->prepare(
                 "SELECT i.status AS inscricao_status,
-                        pb.status AS pagamento_status,
+                        pg.status AS pagamento_status,
                         rk.status AS retirada_status
                  FROM inscricoes i
-                 LEFT JOIN pagamentos_belluno pb ON pb.inscricao_id = i.id
+                 LEFT JOIN pagamentos_gateway pg ON pg.inscricao_id = i.id
                  LEFT JOIN retiradas_kit rk ON rk.inscricao_id = i.id
                  WHERE i.id = ? LIMIT 1"
             );
@@ -2412,9 +2189,9 @@ try {
             ]);
         } else {
             $info = $db->prepare(
-                "SELECT i.status AS inscricao_status, pb.status AS pagamento_status
+                "SELECT i.status AS inscricao_status, pg.status AS pagamento_status
                  FROM inscricoes i
-                 LEFT JOIN pagamentos_belluno pb ON pb.inscricao_id = i.id
+                 LEFT JOIN pagamentos_gateway pg ON pg.inscricao_id = i.id
                  WHERE i.id = ? LIMIT 1"
             );
             $info->execute([$id]);
@@ -2458,6 +2235,9 @@ try {
             ], 409);
         }
 
+
+        auditLog($db, (int)$u['sub'], $acao === 'withdraw-kit' ? 'KIT_RETIRADO' : 'CHECKIN_REALIZADO', $acao === 'withdraw-kit' ? 'retiradas_kit' : 'checkins', $id, 'Operação registrada no painel administrativo.');
+
         resposta([
             'ok' => true
         ]);
@@ -2468,10 +2248,12 @@ try {
     ], 404);
 
 } catch (Exception $e) {
+    $incidentId = strtoupper(substr(md5(uniqid('', true)), 0, 8));
+    error_log('[MPL API][' . $incidentId . '] ' . $e->getMessage());
     resposta([
         'error' => $config['debug']
             ? $e->getMessage()
-            : 'Erro interno. Verifique o XAMPP e o MySQL.'
+            : 'Não foi possível concluir a operação. Código: ' . $incidentId
     ], 500);
 }
 

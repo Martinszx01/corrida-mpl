@@ -1,0 +1,7 @@
+.env
+config.local.php
+storage/*.log
+storage/*.secret
+*.zip
+
+!.env.example

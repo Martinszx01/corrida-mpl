@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/compat.php';
+require_once __DIR__ . '/mail_service.php';
 $dotenv = __DIR__ . '/.env';
 if (is_file($dotenv)) {
     $lines = file($dotenv, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -36,24 +37,26 @@ $config = [
     'jwt_secret' => getenv('JWT_SECRET') ?: 'troque-esta-chave-em-producao',
     'cors_origin' => getenv('CORS_ORIGIN') ?: '*',
     'debug' => filter_var(getenv('APP_DEBUG') ?: '0', FILTER_VALIDATE_BOOLEAN),
-    'site_url' => getenv('SITE_URL') ?: 'http://192.168.0.137/corrida-mpl',
+    'allow_bootstrap_admin' => filter_var(getenv('ALLOW_BOOTSTRAP_ADMIN') ?: '0', FILTER_VALIDATE_BOOLEAN),
+    'site_url' => getenv('SITE_URL') ?: 'https://app.grupompl.com.br/corrida-mpl',
     'event_slug' => '4-corrida-mpl',
-    'owner_email' => 'admin@grupompl.com.br',
-    'event_date_fallback' => '2026-11-29',
+    'event_date_fallback' => '2026-11-14',
     'event_start_time_fallback' => '07:00',
     'pagarme_secret_key' => getenv('PAGARME_SECRET_KEY') ?: '',
     'pagarme_base_url' => getenv('PAGARME_BASE_URL') ?: 'https://api.pagar.me/core/v5',
     'pagarme_checkout_expires_minutes' => getenv('PAGARME_CHECKOUT_EXPIRES_MINUTES') ?: '60',
     'pagarme_max_installments' => getenv('PAGARME_MAX_INSTALLMENTS') ?: '3',
     'invitation_expires_hours' => getenv('INVITATION_EXPIRES_HOURS') ?: '168',
-    'belluno_env' => getenv('BELLUNO_ENV') ?: 'sandbox',
-    'belluno_token' => getenv('BELLUNO_TOKEN') ?: '',
-    'belluno_base_url' => getenv('BELLUNO_BASE_URL') ?: '',
-    'belluno_visitor_id' => getenv('BELLUNO_VISITOR_ID') ?: '',
-    'belluno_postback_url' => getenv('BELLUNO_POSTBACK_URL') ?: '',
-    'belluno_postback_secret' => getenv('BELLUNO_POSTBACK_SECRET') ?: '',
     'mail_enabled' => getenv('MAIL_ENABLED') ?: '1',
-    'mail_from' => getenv('MAIL_FROM') ?: 'noreply@grupompl.com.br'
+    'mail_from' => getenv('MAIL_FROM') ?: 'noreply@grupompl.com.br',
+    'mail_transport' => getenv('MAIL_TRANSPORT') ?: 'mail',
+    'mail_smtp_host' => getenv('MAIL_SMTP_HOST') ?: '',
+    'mail_smtp_port' => getenv('MAIL_SMTP_PORT') ?: '587',
+    'mail_smtp_encryption' => getenv('MAIL_SMTP_ENCRYPTION') ?: 'tls',
+    'mail_smtp_username' => getenv('MAIL_SMTP_USERNAME') ?: '',
+    'mail_smtp_password' => getenv('MAIL_SMTP_PASSWORD') ?: '',
+    'mail_smtp_timeout' => getenv('MAIL_SMTP_TIMEOUT') ?: '10',
+    'mail_worker_secret' => getenv('MAIL_WORKER_SECRET') ?: ''
 ];
 if (is_file(__DIR__ . '/config.local.php')) {
     $local = require __DIR__ . '/config.local.php';

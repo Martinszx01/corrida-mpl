@@ -1,7 +1,6 @@
 Options -MultiViews
 DirectoryIndex index.php index.html
 RewriteEngine On
-RewriteBase /corrida-mpl-php-js-html-css/
 
 # --- Segurança: bloquear acesso direto a arquivos sensíveis ---
 <FilesMatch "(^\.env$|\.env\..*|\.sql$|\.secret$|\.md$|composer\.(json|lock)$|config\.local\.php$|config\.local\.example\.php$)">
@@ -14,8 +13,8 @@ RewriteBase /corrida-mpl-php-js-html-css/
   </IfModule>
 </FilesMatch>
 
-# Bloquear a pasta de banco por completo
-RedirectMatch 403 ^/corrida-mpl-php-js-html-css/database/.*$
+# Bloquear pastas internas sem depender do nome usado na URL pública
+RewriteRule ^(?:database|storage)(?:/|$) - [F,L,NC]
 RewriteRule ^vendor/.*\.php$ - [F,L,NC]
 
 # --- Cabeçalhos de segurança ---
@@ -23,6 +22,9 @@ RewriteRule ^vendor/.*\.php$ - [F,L,NC]
   Header always set X-Content-Type-Options "nosniff"
   Header always set X-Frame-Options "SAMEORIGIN"
   Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set Permissions-Policy "camera=(self), geolocation=(), microphone=()"
+  Header always set X-Permitted-Cross-Domain-Policies "none"
+  Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains" env=HTTPS
 </IfModule>
 
 # --- Roteamento SPA: arquivos/pastas reais são servidos; o resto vai ao index.php ---

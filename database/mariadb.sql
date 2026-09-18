@@ -1,12 +1,4 @@
--- =====================================================================
--- 4ª Corrida MPL - Estrutura completa do banco
--- Compatível com MariaDB 5.5.62 / MySQL 5.5
---   * DATETIME nunca usa DEFAULT CURRENT_TIMESTAMP (não suportado no 5.5)
---   * Apenas UMA coluna TIMESTAMP por tabela usa CURRENT_TIMESTAMP
---   * Colunas de atualização automática usam NOW() explícito no backend
--- O banco pode iniciar vazio: os dados de negócio (categorias, lotes,
--- valores, etc.) são criados pelo painel administrativo.
--- =====================================================================
+
 
 CREATE DATABASE IF NOT EXISTS corrida_mpl CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE corrida_mpl;
@@ -134,6 +126,31 @@ CREATE TABLE IF NOT EXISTS pagamentos (
     KEY idx_pagamentos_inscricao (inscricao_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS pagamentos_gateway (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    inscricao_id INT UNSIGNED NOT NULL,
+    metodo ENUM('CHECKOUT','PIX','CARD') NOT NULL DEFAULT 'CHECKOUT',
+    payment_link_id VARCHAR(120) NULL,
+    payment_link_url VARCHAR(500) NULL,
+    order_id VARCHAR(120) NULL,
+    referencia_externa VARCHAR(160) NOT NULL,
+    valor DECIMAL(10,2) NOT NULL,
+    status ENUM('PROCESSING','PAID','FAILED','EXPIRED','CANCELLED','REFUNDED') NOT NULL DEFAULT 'PROCESSING',
+    status_gateway VARCHAR(80) NULL,
+    checkout_expira_em DATETIME NULL,
+    confirmado_em DATETIME NULL,
+    email_confirmacao_em DATETIME NULL,
+    email_tentativa_em DATETIME NULL,
+    tentativas_email SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    ultimo_erro_email VARCHAR(255) NULL,
+    erro_tecnico VARCHAR(1000) NULL,
+    criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    atualizado_em DATETIME NULL,
+    UNIQUE KEY uq_pg_inscricao (inscricao_id),
+    UNIQUE KEY uq_pg_link (payment_link_id),
+    KEY idx_pg_referencia (referencia_externa)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS tickets (
     id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     inscricao_id INT UNSIGNED NOT NULL UNIQUE,
@@ -185,6 +202,40 @@ CREATE TABLE IF NOT EXISTS logs_auditoria (
     criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS participante_codigos_acesso (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(180) NOT NULL,
+    codigo_hash CHAR(64) NOT NULL,
+    expira_em DATETIME NOT NULL,
+    tentativas TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    utilizado_em DATETIME NULL,
+    criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_codigo_email (email, criado_em),
+    KEY idx_codigo_expira (expira_em)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS participante_sessoes (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    token_hash CHAR(64) NOT NULL UNIQUE,
+    email VARCHAR(180) NOT NULL,
+    expira_em DATETIME NOT NULL,
+    revogado_em DATETIME NULL,
+    ultimo_acesso_em DATETIME NULL,
+    criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_sessao_email (email),
+    KEY idx_sessao_expira (expira_em)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS limites_requisicao (
+    chave_hash CHAR(64) PRIMARY KEY,
+    acao VARCHAR(60) NOT NULL,
+    janela_inicio DATETIME NOT NULL,
+    tentativas SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    bloqueado_ate DATETIME NULL,
+    atualizado_em DATETIME NOT NULL,
+    KEY idx_limite_atualizado (atualizado_em)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS convites_colaboradores (
     id INT UNSIGNED NOT NULL AUTO_INCREMENT,
     corrida_id INT UNSIGNED NOT NULL,
@@ -206,34 +257,6 @@ CREATE TABLE IF NOT EXISTS convites_colaboradores (
     KEY idx_convites_corrida (corrida_id),
     KEY idx_convites_categoria (categoria_id),
     KEY idx_convites_status (utilizado_em, cancelado_em, expira_em)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- Ledger próprio da integração Belluno.
--- Não armazena número de cartão, CVV, validade ou card_hash.
-CREATE TABLE IF NOT EXISTS pagamentos_belluno (
-    id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-    inscricao_id INT UNSIGNED NOT NULL,
-    metodo ENUM('PIX','CARD') NOT NULL,
-    transaction_id VARCHAR(120) NULL,
-    referencia_externa VARCHAR(160) NOT NULL,
-    valor DECIMAL(10,2) NOT NULL,
-    status ENUM('PENDING_PAYMENT','PROCESSING','PAID','FAILED','EXPIRED','CANCELLED','REFUNDED') NOT NULL DEFAULT 'PENDING_PAYMENT',
-    status_belluno VARCHAR(80) NULL,
-    pix_code TEXT NULL,
-    pix_expira_em DATETIME NULL,
-    erro_tecnico VARCHAR(1000) NULL,
-    confirmado_em DATETIME NULL,
-    email_inscricao_em DATETIME NULL,
-    email_confirmacao_em DATETIME NULL,
-    tentativas SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-    criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    atualizado_em TIMESTAMP NOT NULL DEFAULT '1970-01-01 00:00:01',
-    PRIMARY KEY (id),
-    UNIQUE KEY uq_pagamentos_belluno_inscricao (inscricao_id),
-    UNIQUE KEY uq_pagamentos_belluno_transaction (transaction_id),
-    KEY idx_pagamentos_belluno_status (status),
-    KEY idx_pagamentos_belluno_referencia (referencia_externa),
-    CONSTRAINT fk_pagamentos_belluno_inscricao FOREIGN KEY (inscricao_id) REFERENCES inscricoes(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Solicitações e publicação de patrocinadores da 4ª Corrida MPL.
@@ -267,5 +290,5 @@ CREATE TABLE IF NOT EXISTS patrocinadores (
 -- Configuração mínima obrigatória: a corrida/evento usada pelo sistema.
 -- (Categorias, lotes e valores são cadastrados pelo painel administrativo.)
 INSERT INTO corridas (nome, slug, edicao, data_corrida, horario_largada, status, inscricoes_abertas)
-SELECT '4ª Corrida MPL', '4-corrida-mpl', 4, '2026-11-29', '07:00:00', 'publicada', 0
+SELECT '4ª Corrida MPL', '4-corrida-mpl', 4, '2026-11-14', '07:00:00', 'publicada', 0
 WHERE NOT EXISTS (SELECT 1 FROM corridas WHERE slug = '4-corrida-mpl');
